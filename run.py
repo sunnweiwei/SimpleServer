@@ -8,28 +8,24 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import code
+import threading
 
 # Import the apply_patch functionality
 from apply_patch import process_patch, open_file, write_file, remove_file
 
-# For Jupyter notebook execution
-import nbformat
-from nbclient import NotebookClient
-from nbclient.exceptions import CellExecutionError, CellTimeoutError
-from queue import Queue
-
 # Maximum time to wait for command execution (in seconds)
-EXECUTION_TIMEOUT = 120
+EXECUTION_TIMEOUT = 60.0
 LINE_LIMIT = 2000  # Maximum number of output lines to return
 
-# Global kernel session for stateful execution
-notebook_kernel = None
+# Global interactive interpreter for stateful execution
+interpreter = None
+interpreter_lock = threading.Lock()
 
 
 class TimeoutException(Exception):
@@ -44,12 +40,14 @@ def time_limit(seconds):
     def signal_handler(signum, frame):
         raise TimeoutException("Execution timed out")
 
+    original_handler = signal.getsignal(signal.SIGALRM)
     signal.signal(signal.SIGALRM, signal_handler)
     signal.alarm(int(seconds))
     try:
         yield
     finally:
         signal.alarm(0)
+        signal.signal(signal.SIGALRM, original_handler)
 
 
 def capture_output(cmd: str) -> Tuple[int, str]:
@@ -116,32 +114,43 @@ def run_command(cmd: str) -> str:
         return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
 
 
-def get_or_create_notebook_kernel():
+class CaptureOutput:
+    """Capture stdout and stderr."""
+
+    def __init__(self):
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+
+    def __enter__(self):
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+
+    def get_output(self):
+        return self.stdout.getvalue() + self.stderr.getvalue()
+
+
+def get_or_create_interpreter():
     """
-    Get or create a Jupyter notebook kernel for stateful execution.
+    Get or create a Python interpreter for stateful execution.
 
     Returns:
-        NotebookClient: A notebook client with a running kernel
+        code.InteractiveInterpreter: An interactive interpreter
     """
-    global notebook_kernel
+    global interpreter
 
-    if notebook_kernel is None:
-        # Create a new notebook with a single cell
-        notebook = nbformat.v4.new_notebook()
+    if interpreter is None:
+        # Create a new interpreter with a fresh namespace
+        interpreter = code.InteractiveInterpreter()
 
-        # Create a client to execute the notebook
-        notebook_kernel = NotebookClient(
-            notebook,
-            timeout=EXECUTION_TIMEOUT,
-            kernel_name="python3",
-            resources={}
-        )
-
-        # Start the kernel
-        notebook_kernel.start_new_kernel()
-
-        # Initialize the kernel with necessary imports
-        init_cell = nbformat.v4.new_code_cell("""
+        # Initialize with some common imports
+        interpreter.runsource("""
 import sys
 import os
 import io
@@ -149,58 +158,40 @@ import traceback
 from contextlib import redirect_stdout, redirect_stderr
         """)
 
-        try:
-            notebook_kernel.execute_cell(init_cell)
-        except Exception as e:
-            print(f"Error initializing kernel: {str(e)}")
-
-    return notebook_kernel
+    return interpreter
 
 
-def execute_python_notebook(code: str) -> str:
+def execute_python_interpreter(code_str: str) -> str:
     """
-    Execute Python code in a Jupyter notebook environment.
+    Execute Python code in an interactive interpreter.
 
     Args:
-        code: Python code to execute
+        code_str: Python code to execute
 
     Returns:
         Execution output
     """
-    kernel = get_or_create_notebook_kernel()
+    global interpreter_lock
 
-    # Create a new cell with the code
-    cell = nbformat.v4.new_code_cell(code)
+    with interpreter_lock:  # Ensure thread safety
+        interpreter = get_or_create_interpreter()
 
-    try:
-        # Execute the cell
-        kernel.execute_cell(cell)
+        with CaptureOutput() as output:
+            try:
+                with time_limit(EXECUTION_TIMEOUT):
+                    # Execute the code
+                    more = interpreter.runsource(code_str)
 
-        # Collect outputs
-        outputs = []
-        for output in cell.outputs:
-            if output.output_type == 'stream':
-                outputs.append(output.text)
-            elif output.output_type == 'display_data' and 'text/plain' in output.data:
-                outputs.append(output.data['text/plain'])
-            elif output.output_type == 'execute_result' and 'text/plain' in output.data:
-                outputs.append(output.data['text/plain'])
-            elif output.output_type == 'error':
-                # Format error output similar to a traceback
-                err_name = output.ename
-                err_value = output.evalue
-                err_traceback = '\n'.join(output.traceback)
-                outputs.append(f"{err_name}: {err_value}\n{err_traceback}")
+                    # If more is True, the input is incomplete
+                    if more:
+                        return "Incomplete input. Please provide complete Python statements."
+            except TimeoutException:
+                return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                traceback.print_exc()
 
-        # Join all outputs
-        return '\n'.join(outputs)
-
-    except CellTimeoutError:
-        return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
-    except CellExecutionError as e:
-        return f"Execution error: {str(e)}"
-    except Exception as e:
-        return f"Error: {str(e)}\n{traceback.format_exc()}"
+        return output.get_output()
 
 
 def handle_apply_patch(patch_text: str) -> str:
@@ -255,7 +246,7 @@ def process_input(input_text: str) -> str:
         return f"Magic command {magic_type} is not supported."
 
     # Otherwise, assume it's Python code
-    return execute_python_notebook(input_text)
+    return execute_python_interpreter(input_text)
 
 
 def parse_agent_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -328,32 +319,20 @@ def handle_agent_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def cleanup_notebook_kernel():
-    """Clean up the notebook kernel when the server shuts down."""
-    global notebook_kernel
-    if notebook_kernel:
-        try:
-            notebook_kernel.kc.stop_channels()
-            notebook_kernel.km.shutdown_kernel()
-        except:
-            pass
-
-
 def main():
     """
     Main entry point for the server.
     """
     import argparse
-    import atexit
 
-    # Register cleanup function to handle kernel shutdown
-    atexit.register(cleanup_notebook_kernel)
-
-    parser = argparse.ArgumentParser(
-        description='Execute Python code or terminal commands in a Jupyter notebook environment')
-    parser.add_argument('--port', type=int, default=4444, help='Port to listen on')
+    parser = argparse.ArgumentParser(description='Execute Python code or terminal commands in a stateful environment')
+    parser.add_argument('--port', type=int, default=8000, help='Port to listen on')
     parser.add_argument('--host', type=str, default='localhost', help='Host to bind to')
     args = parser.parse_args()
+
+    # Initialize the interpreter on startup
+    get_or_create_interpreter()
+    print(f"Python interpreter initialized")
 
     # For simplicity, we'll use Flask for the web server
     try:
@@ -367,19 +346,11 @@ def main():
             result = handle_agent_request(request_data)
             return jsonify(result)
 
-        # Initialize the notebook kernel on startup
-        get_or_create_notebook_kernel()
-        print(f"Jupyter kernel initialized")
         print(f"Server running on {args.host}:{args.port}")
         app.run(host=args.host, port=args.port)
 
     except ImportError as e:
-        required_packages = ["flask", "nbformat", "nbclient"]
-        missing_package = next((pkg for pkg in required_packages if pkg in str(e)), None)
-        if missing_package:
-            print(f"{missing_package} is not installed. Please install it with 'pip install {missing_package}'")
-        else:
-            print(f"Missing required packages. Please install with: pip install flask nbformat nbclient")
+        print(f"Flask is not installed. Please install it with 'pip install flask'")
         sys.exit(1)
 
 
