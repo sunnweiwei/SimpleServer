@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-"""Flask server for executing **all** SWE‑Bench tool calls with /testbed root.
+"""Flask server to execute SWE‑Bench tool calls with clean error traces.
 
-Highlights
+Key points
 ==========
-* **Default working dir** → `/testbed` for shell, Python, and `apply_patch`.
-* **Python execution** – stateful globals across requests.
-* **Shell commands**   – run each `!cmd` line via subprocess in `/testbed`.
-* **Mixed cells**      – Jupyter‑style interleaving of `!` and Python.
-* **apply_patch**      – V4A patches applied relative to `/testbed`.
-* **Multi‑call support** – sequentially executes every `function_call`.
+* **Working directory** – all actions run relative to `/testbed`.
+* **Mixed cell execution** – Jupyter‑style `!shell` + Python.
+* **apply_patch** – V4A patches applied with relative paths.
+* **Multi‑call support** – executes every `function_call`.
+* **Clean errors** – stack traces stripped of server internals; only user‑relevant
+  frames (those in `<string>` or under `/testbed`) are returned.
 """
 
 import io
@@ -26,23 +26,24 @@ from typing import Any, Dict, List, Tuple
 
 from flask import Flask, jsonify, request
 
-import apply_patch  # SWE‑Bench helper
+import apply_patch
 
 ###############################################################################
-# Constants & environment
+# Environment & constants
 ###############################################################################
 
 ROOT = Path("/testbed").resolve()
-os.chdir(ROOT)  # Ensure server starts in /testbed
+os.chdir(ROOT)
+SERVER_FILE = Path(__file__).resolve().as_posix()
 
 ###############################################################################
-# Flask setup
+# Flask setup
 ###############################################################################
 
 app = Flask(__name__)
 
 ###############################################################################
-# Global Python execution context (stateful across calls & cells)
+# Shared Python globals
 ###############################################################################
 
 _EXEC_GLOBALS: Dict[str, Any] = {
@@ -51,7 +52,51 @@ _EXEC_GLOBALS: Dict[str, Any] = {
 }
 
 ###############################################################################
-# Utility helpers
+# Error‑trace sanitiser
+###############################################################################
+
+def _clean_trace(tb: str) -> str:
+    """Remove frames originating from the server implementation."""
+    cleaned: List[str] = []
+    for line in tb.splitlines():
+        if SERVER_FILE in line or "/flask/" in line or "/runpy.py" in line:
+            continue  # strip server & framework frames
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+###############################################################################
+# Low‑level executors
+###############################################################################
+
+def _exec_python(src: str) -> Tuple[str, str]:
+    os.chdir(ROOT)
+    out_io, err_io = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out_io), redirect_stderr(err_io):
+            exec(src, _EXEC_GLOBALS)  # nosec – trusted agent code
+    except Exception:  # pylint: disable=broad-except
+        err_io.write(_clean_trace(traceback.format_exc()))
+    return out_io.getvalue(), err_io.getvalue()
+
+
+def _exec_shell(cmd: str) -> Tuple[str, str]:
+    proc = subprocess.Popen(cmd, shell=True, text=True, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        stderr = _clean_trace(stderr or f"Command exited with {proc.returncode}")
+    return stdout, stderr
+
+
+def _exec_apply_patch(block: str) -> Tuple[str, str]:
+    os.chdir(ROOT)
+    try:
+        res = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file)
+        return res + "\n", ""
+    except Exception:  # pylint: disable=broad-except
+        return "", _clean_trace(traceback.format_exc())
+
+###############################################################################
+# Timeout wrapper
 ###############################################################################
 
 def _run_with_timeout(fn, timeout: int, *args, **kwargs) -> Tuple[str, str, bool]:
@@ -62,78 +107,39 @@ def _run_with_timeout(fn, timeout: int, *args, **kwargs) -> Tuple[str, str, bool
             o, e = fn(*args, **kwargs)
             out[0], err[0] = o, e
         except Exception:  # pylint: disable=broad-except
-            err[0] = traceback.format_exc()
+            err[0] = _clean_trace(traceback.format_exc())
 
     th = threading.Thread(target=_target, daemon=True)
     th.start()
     th.join(timeout)
     if th.is_alive():
-        return "", f"Timed out after {timeout}s", True
+        return "", "Timed out", True
     return out.get(0, ""), err.get(0, ""), False
 
-
-def _exec_python(src: str) -> Tuple[str, str]:
-    # Guarantee we are inside /testbed for any relative paths
-    os.chdir(ROOT)
-    out_io, err_io = io.StringIO(), io.StringIO()
-    with redirect_stdout(out_io), redirect_stderr(err_io):
-        exec(src, _EXEC_GLOBALS)  # nosec – trusted agent code
-    return out_io.getvalue(), err_io.getvalue()
-
-
-def _exec_shell(cmd: str) -> Tuple[str, str]:
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        text=True,
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    stdout, stderr = proc.communicate()
-    if proc.returncode != 0:
-        stderr = f"[exit {proc.returncode}] {stderr}"
-    return stdout, stderr
-
-
-def _exec_apply_patch(block: str) -> Tuple[str, str]:
-    # Ensure cwd for file operations
-    os.chdir(ROOT)
-    try:
-        res = apply_patch.process_patch(
-            block,
-            apply_patch.open_file,
-            apply_patch.write_file,
-            apply_patch.remove_file,
-        )
-        return res + "\n", ""
-    except Exception:  # pylint: disable=broad-except
-        return "", traceback.format_exc()
-
 ###############################################################################
-# Dispatcher – handles !shell, python, and apply_patch in a single cell
+# Cell dispatcher
 ###############################################################################
 
 def _dispatch(cell: str) -> Tuple[str, str]:
     cell = textwrap.dedent(cell)
 
-    # ---- apply_patch block ----
+    # Handle apply_patch cell
     if cell.lstrip().startswith("%%bash") and "apply_patch" in cell:
+        lines = cell.splitlines()
         patch_lines: List[str] = []
-        capture = False
-        for ln in cell.splitlines():
+        cap = False
+        for ln in lines:
             if "apply_patch" in ln:
-                capture = False
+                cap = False
             if "<<\"EOF\"" in ln or ln.strip().endswith("<<EOF"):
-                capture = True
+                cap = True
                 continue
-            if ln.strip() == "EOF" and capture:
+            if ln.strip() == "EOF" and cap:
                 break
-            if capture:
+            if cap:
                 patch_lines.append(ln)
         return _exec_apply_patch("\n".join(patch_lines))
 
-    # ---- Mixed Jupyter‑style cell ----
     py_buf: List[str] = []
     outs, errs = [], []
 
@@ -153,11 +159,10 @@ def _dispatch(cell: str) -> Tuple[str, str]:
         else:
             py_buf.append(ln)
     flush_py()
-
     return "".join(outs), "".join(errs)
 
 ###############################################################################
-# Routes
+# Flask routes
 ###############################################################################
 
 @app.route("/alive", methods=["GET"])
@@ -181,16 +186,16 @@ def execute():
         try:
             args = json.loads(msg.get("arguments", "{}"))
         except json.JSONDecodeError as exc:
-            results.append({"index": idx, "call_id": msg['call_id'], "output": "", "error": f"Bad JSON: {exc}", "timed_out": False, "duration": 0.0})
+            results.append({"index": idx, "output": "", "error": str(exc), "timed_out": False, "duration": 0.0})
             continue
         code_inp = args.get("input")
         if code_inp is None:
-            results.append({"index": idx, "call_id": msg['call_id'], "output": "", "error": "'input' missing", "timed_out": False, "duration": 0.0})
+            results.append({"index": idx, "output": "", "error": "'input' missing", "timed_out": False, "duration": 0.0})
             continue
 
         start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code_inp)
-        results.append({"index": idx, "call_id": msg['call_id'], "output": out, "error": err, "timed_out": timed, "duration": round(time.time() - start, 3)})
+        results.append({"index": idx, "output": out, "error": err, "timed_out": timed, "duration": round(time.time() - start, 3)})
 
     if not results:
         return jsonify({"error": "No python function_call messages found"}), 400
