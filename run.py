@@ -186,16 +186,16 @@ def execute():
         try:
             args = json.loads(msg.get("arguments", "{}"))
         except json.JSONDecodeError as exc:
-            results.append({"index": idx, "output": "", "error": str(exc), "timed_out": False, "duration": 0.0})
+            results.append({"index": idx, "call_id": msg['call_id'], "output": "", "error": str(exc), "timed_out": False, "duration": 0.0})
             continue
         code_inp = args.get("input")
         if code_inp is None:
-            results.append({"index": idx, "output": "", "error": "'input' missing", "timed_out": False, "duration": 0.0})
+            results.append({"index": idx, "call_id": msg['call_id'], "output": "", "error": "'input' missing", "timed_out": False, "duration": 0.0})
             continue
 
         start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code_inp)
-        results.append({"index": idx, "output": out, "error": err, "timed_out": timed, "duration": round(time.time() - start, 3)})
+        results.append({"index": idx, "call_id": msg['call_id'], "output": out, "error": err, "timed_out": timed, "duration": round(time.time() - start, 3)})
 
     if not results:
         return jsonify({"error": "No python function_call messages found"}), 400
