@@ -207,7 +207,14 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
     patch_path = Path('/tmp/patch.diff'); patch_path.write_text(model_patch)
     script_path = Path('/tmp/eval.sh'); script_path.write_text(eval_script); script_path.chmod(0o755)
     cwd = workdir.resolve()
-    apply_cmd = "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || (patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || echo 'APPLY_PATCH_FAIL'"
+    # apply_cmd = "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || (patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || echo 'APPLY_PATCH_FAIL'"
+    apply_cmd = (
+        'cd /testbed && '
+        "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
+        "(echo 'Failed to apply patch with git apply, trying with patch command...' && "
+        "(patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
+        "echo 'APPLY_PATCH_FAIL')))"
+    )
     out, err, _ = _exec_shell(apply_cmd, cwd)
     apply_out = (out + err).strip(); report['apply_output'] = apply_out
     if 'APPLY_PATCH_FAIL' in apply_out:
@@ -289,10 +296,6 @@ def evaluate_endpoint():
     return jsonify({'report': report})
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# NEW: /command – run an arbitrary shell command
-# --------------------------------------------------------------------------
-
 @app.route('/command', methods=['POST'])
 def command_endpoint():
     """Run a single shell command and return stdout/stderr/rc."""
@@ -320,3 +323,4 @@ def command_endpoint():
 if __name__ == '__main__':
     port = 4444
     app.run(host='0.0.0.0', port=port, threaded=True)
+
