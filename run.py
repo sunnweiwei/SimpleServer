@@ -25,7 +25,7 @@ from nbclient.exceptions import CellExecutionError, CellTimeoutError
 from queue import Queue
 
 # Maximum time to wait for command execution (in seconds)
-EXECUTION_TIMEOUT = 120.0
+EXECUTION_TIMEOUT = 120
 LINE_LIMIT = 2000  # Maximum number of output lines to return
 
 # Global kernel session for stateful execution
