@@ -1,4 +1,5 @@
 # server.py
+from __future__ import annotations
 import sys
 import io
 import json
@@ -10,6 +11,17 @@ import threading
 from flask import Flask, request, jsonify
 from queue import Queue
 from contextlib import redirect_stdout
+# import pathlib # Already imported
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 # --- Configuration ---
 WORKSPACE_DIR = pathlib.Path("/testbed")
@@ -26,22 +38,6 @@ python_locals = {} # Separate locals can sometimes be useful
 # --- Create Workspace ---
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- apply_patch.py Logic (Embedded) ---
-# Note: Copied directly from the provided code.
-# Modifications: File operations are now relative to WORKSPACE_DIR.
-from __future__ import annotations
-
-# import pathlib # Already imported
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import (
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
 
 
 # --------------------------------------------------------------------------- #
