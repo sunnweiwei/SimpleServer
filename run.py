@@ -4,17 +4,16 @@ import io
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import code
-import threading
 
 # Import the apply_patch functionality
 from apply_patch import process_patch, open_file, write_file, remove_file
@@ -28,26 +27,57 @@ interpreter = None
 interpreter_lock = threading.Lock()
 
 
-class TimeoutException(Exception):
+class TimeoutError(Exception):
     """Exception raised when code execution times out."""
     pass
 
 
-@contextmanager
-def time_limit(seconds):
-    """Context manager to limit execution time."""
+def run_with_timeout(func, args=(), kwargs=None, timeout=EXECUTION_TIMEOUT):
+    """
+    Run a function with a timeout using threading.
+    This is a thread-safe alternative to using signal.alarm().
 
-    def signal_handler(signum, frame):
-        raise TimeoutException("Execution timed out")
+    Args:
+        func: Function to run
+        args: Arguments to pass to the function
+        kwargs: Keyword arguments to pass to the function
+        timeout: Timeout in seconds
 
-    original_handler = signal.getsignal(signal.SIGALRM)
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(int(seconds))
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, original_handler)
+    Returns:
+        Result of the function
+
+    Raises:
+        TimeoutError: If the function times out
+    """
+    if kwargs is None:
+        kwargs = {}
+
+    result = [None]
+    exception = [None]
+    completed = [False]
+
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+            completed[0] = True
+        except Exception as e:
+            exception[0] = e
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout)
+
+    if not completed[0]:
+        if thread.is_alive():
+            raise TimeoutError(f"Function timed out after {timeout} seconds")
+        elif exception[0]:
+            raise exception[0]
+
+    if exception[0]:
+        raise exception[0]
+
+    return result[0]
 
 
 def capture_output(cmd: str) -> Tuple[int, str]:
@@ -60,40 +90,50 @@ def capture_output(cmd: str) -> Tuple[int, str]:
     Returns:
         Tuple of (return_code, output)
     """
-    process = subprocess.Popen(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding='utf-8',
-        errors='replace'
-    )
+    try:
+        # Function to be run with timeout
+        def run_command():
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
 
-    output_lines = []
-    line_count = 0
-    truncated = False
+            output_lines = []
+            line_count = 0
+            truncated = False
 
-    while True:
-        line = process.stdout.readline()
-        if not line and process.poll() is not None:
-            break
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
 
-        output_lines.append(line)
-        line_count += 1
+                output_lines.append(line)
+                line_count += 1
 
-        if line_count >= LINE_LIMIT:
-            truncated = True
-            process.terminate()
-            break
+                if line_count >= LINE_LIMIT:
+                    truncated = True
+                    process.terminate()
+                    break
 
-    return_code = process.wait()
-    output = ''.join(output_lines)
+            return_code = process.wait()
+            output = ''.join(output_lines)
 
-    if truncated:
-        output += f"\n[Output truncated after {LINE_LIMIT} lines]"
+            if truncated:
+                output += f"\n[Output truncated after {LINE_LIMIT} lines]"
 
-    return return_code, output
+            return return_code, output
+
+        # Run the command with timeout
+        return run_with_timeout(run_command)
+    except TimeoutError:
+        return (1, f"Command timed out after {EXECUTION_TIMEOUT} seconds.")
+    except Exception as e:
+        return (1, f"Error executing command: {str(e)}")
 
 
 def run_command(cmd: str) -> str:
@@ -107,11 +147,10 @@ def run_command(cmd: str) -> str:
         Command output
     """
     try:
-        with time_limit(EXECUTION_TIMEOUT):
-            return_code, output = capture_output(cmd)
-            return output
-    except TimeoutException:
-        return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
+        return_code, output = capture_output(cmd)
+        return output
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 class CaptureOutput:
@@ -133,7 +172,11 @@ class CaptureOutput:
         sys.stderr = self.old_stderr
 
     def get_output(self):
-        return self.stdout.getvalue() + self.stderr.getvalue()
+        stdout_value = self.stdout.getvalue()
+        stderr_value = self.stderr.getvalue()
+        if stderr_value:
+            return stdout_value + "\n" + stderr_value
+        return stdout_value
 
 
 def get_or_create_interpreter():
@@ -162,9 +205,44 @@ def get_or_create_interpreter():
     return interpreter
 
 
+def execute_python_code(code_str: str):
+    """
+    Execute Python code in a way that can be run with timeout.
+    This is wrapped by execute_python_interpreter to handle timeouts.
+
+    Args:
+        code_str: Python code to execute
+
+    Returns:
+        Execution output
+    """
+    interpreter = get_or_create_interpreter()
+
+    with CaptureOutput() as output:
+        # Split the code into lines
+        lines = code_str.splitlines()
+
+        # Handle empty input
+        if not lines:
+            return ""
+
+        # Check if it's a single line or a multi-line block
+        if len(lines) == 1:
+            # Single line execution
+            more = interpreter.runsource(code_str)
+            if more:
+                return "Incomplete input. Please provide complete Python statements."
+        else:
+            # For multi-line code, execute it as a single unit
+            code_to_exec = compile(code_str, '<input>', 'exec')
+            exec(code_to_exec, interpreter.locals)
+
+    return output.get_output()
+
+
 def execute_python_interpreter(code_str: str) -> str:
     """
-    Execute Python code in an interactive interpreter.
+    Execute Python code in an interactive interpreter with timeout.
 
     Args:
         code_str: Python code to execute
@@ -175,47 +253,14 @@ def execute_python_interpreter(code_str: str) -> str:
     global interpreter_lock
 
     with interpreter_lock:  # Ensure thread safety
-        interpreter = get_or_create_interpreter()
-
-        with CaptureOutput() as output:
-            try:
-                with time_limit(EXECUTION_TIMEOUT):
-                    # Split the code into lines and execute them as a cohesive unit
-                    lines = code_str.splitlines()
-
-                    # Handle empty input
-                    if not lines:
-                        return ""
-
-                    # Check if it's a single line or a multi-line block
-                    if len(lines) == 1:
-                        # Single line execution
-                        more = interpreter.runsource(code_str)
-                        if more:
-                            return "Incomplete input. Please provide complete Python statements."
-                    else:
-                        # For multi-line code, create a temporary file and execute it
-                        fd, path = tempfile.mkstemp(suffix='.py')
-                        try:
-                            with os.fdopen(fd, 'w') as f:
-                                f.write(code_str)
-
-                            # Create a temporary namespace for execution
-                            namespace = {}
-
-                            # Execute the file in the interpreter's namespace
-                            with open(path, 'r') as f:
-                                code_content = f.read()
-                                interpreter.runsource(f"exec('''{code_content}''')")
-                        finally:
-                            os.unlink(path)  # Clean up the temporary file
-            except TimeoutException:
-                return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
-            except Exception as e:
-                print(f"Error: {str(e)}")
-                traceback.print_exc()
-
-        return output.get_output()
+        try:
+            # Run the code execution with timeout
+            result = run_with_timeout(execute_python_code, args=(code_str,))
+            return result
+        except TimeoutError:
+            return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
+        except Exception as e:
+            return f"Error: {str(e)}\n{traceback.format_exc()}"
 
 
 def handle_apply_patch(patch_text: str) -> str:
@@ -351,7 +396,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Execute Python code or terminal commands in a stateful environment')
     parser.add_argument('--port', type=int, default=4444, help='Port to listen on')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to bind to')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to')
     args = parser.parse_args()
 
     # Initialize the interpreter on startup
