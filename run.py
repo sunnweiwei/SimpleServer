@@ -339,6 +339,26 @@ def evaluate_endpoint():
     return jsonify({'report': report})
 
 
+@app.route('/command', methods=['POST'])
+def command_endpoint():
+    """Run a single shell command and return stdout/stderr/rc."""
+    if not request.is_json:
+        return jsonify({'error': 'Request must be JSON'}), 400
+    data = request.get_json()
+    cmd = data.get('cmd') or data.get('command')
+    if not cmd:
+        return jsonify({'error': 'cmd missing'}), 400
+    workdir = Path(data.get('dir', ROOT)).resolve()
+    timeout = int(data.get('timeout', 120))
+    start = time.time()
+    out, err, rc = _exec_shell(cmd, workdir, timeout=timeout)
+    return jsonify({
+        'stdout': out,
+        'stderr': err,
+        'returncode': rc,
+        'duration': round(time.time() - start, 3)
+    })
+
 ###############################################################################
 # Entrypoint
 ###############################################################################
