@@ -1,427 +1,206 @@
-#!/usr/bin/env python3
+from __future__ import annotations
+
+"""Flask server for executing **all** SWE‑Bench tool calls with /testbed root.
+
+Highlights
+==========
+* **Default working dir** → `/testbed` for shell, Python, and `apply_patch`.
+* **Python execution** – stateful globals across requests.
+* **Shell commands**   – run each `!cmd` line via subprocess in `/testbed`.
+* **Mixed cells**      – Jupyter‑style interleaving of `!` and Python.
+* **apply_patch**      – V4A patches applied relative to `/testbed`.
+* **Multi‑call support** – sequentially executes every `function_call`.
+"""
 
 import io
 import json
 import os
-import re
 import subprocess
-import sys
-import tempfile
+import textwrap
 import threading
 import time
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-import code
+from typing import Any, Dict, List, Tuple
 
-# Import the apply_patch functionality
-from apply_patch import process_patch, open_file, write_file, remove_file
+from flask import Flask, jsonify, request
 
-# Maximum time to wait for command execution (in seconds)
-EXECUTION_TIMEOUT = 60.0
-LINE_LIMIT = 2000  # Maximum number of output lines to return
+import apply_patch  # SWE‑Bench helper
 
-# Global interactive interpreter for stateful execution
-interpreter = None
-interpreter_lock = threading.Lock()
+###############################################################################
+# Constants & environment
+###############################################################################
 
+ROOT = Path("/testbed").resolve()
+os.chdir(ROOT)  # Ensure server starts in /testbed
 
-class TimeoutError(Exception):
-    """Exception raised when code execution times out."""
-    pass
+###############################################################################
+# Flask setup
+###############################################################################
 
+app = Flask(__name__)
 
-def run_with_timeout(func, args=(), kwargs=None, timeout=EXECUTION_TIMEOUT):
-    """
-    Run a function with a timeout using threading.
-    This is a thread-safe alternative to using signal.alarm().
+###############################################################################
+# Global Python execution context (stateful across calls & cells)
+###############################################################################
 
-    Args:
-        func: Function to run
-        args: Arguments to pass to the function
-        kwargs: Keyword arguments to pass to the function
-        timeout: Timeout in seconds
+_EXEC_GLOBALS: Dict[str, Any] = {
+    "__name__": "__main__",
+    "__file__": "<agent>",
+}
 
-    Returns:
-        Result of the function
+###############################################################################
+# Utility helpers
+###############################################################################
 
-    Raises:
-        TimeoutError: If the function times out
-    """
-    if kwargs is None:
-        kwargs = {}
+def _run_with_timeout(fn, timeout: int, *args, **kwargs) -> Tuple[str, str, bool]:
+    out, err = {}, {}
 
-    result = [None]
-    exception = [None]
-    completed = [False]
-
-    def target():
+    def _target():
         try:
-            result[0] = func(*args, **kwargs)
-            completed[0] = True
-        except Exception as e:
-            exception[0] = e
+            o, e = fn(*args, **kwargs)
+            out[0], err[0] = o, e
+        except Exception:  # pylint: disable=broad-except
+            err[0] = traceback.format_exc()
 
-    thread = threading.Thread(target=target)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout)
-
-    if not completed[0]:
-        if thread.is_alive():
-            raise TimeoutError(f"Function timed out after {timeout} seconds")
-        elif exception[0]:
-            raise exception[0]
-
-    if exception[0]:
-        raise exception[0]
-
-    return result[0]
+    th = threading.Thread(target=_target, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return "", f"Timed out after {timeout}s", True
+    return out.get(0, ""), err.get(0, ""), False
 
 
-def capture_output(cmd: str) -> Tuple[int, str]:
-    """
-    Execute a command and capture its output.
+def _exec_python(src: str) -> Tuple[str, str]:
+    # Guarantee we are inside /testbed for any relative paths
+    os.chdir(ROOT)
+    out_io, err_io = io.StringIO(), io.StringIO()
+    with redirect_stdout(out_io), redirect_stderr(err_io):
+        exec(src, _EXEC_GLOBALS)  # nosec – trusted agent code
+    return out_io.getvalue(), err_io.getvalue()
 
-    Args:
-        cmd: Command to execute
 
-    Returns:
-        Tuple of (return_code, output)
-    """
+def _exec_shell(cmd: str) -> Tuple[str, str]:
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        text=True,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        stderr = f"[exit {proc.returncode}] {stderr}"
+    return stdout, stderr
+
+
+def _exec_apply_patch(block: str) -> Tuple[str, str]:
+    # Ensure cwd for file operations
+    os.chdir(ROOT)
     try:
-        # Function to be run with timeout
-        def run_command():
-            process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace'
-            )
+        res = apply_patch.process_patch(
+            block,
+            apply_patch.open_file,
+            apply_patch.write_file,
+            apply_patch.remove_file,
+        )
+        return res + "\n", ""
+    except Exception:  # pylint: disable=broad-except
+        return "", traceback.format_exc()
 
-            output_lines = []
-            line_count = 0
-            truncated = False
+###############################################################################
+# Dispatcher – handles !shell, python, and apply_patch in a single cell
+###############################################################################
 
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
+def _dispatch(cell: str) -> Tuple[str, str]:
+    cell = textwrap.dedent(cell)
 
-                output_lines.append(line)
-                line_count += 1
+    # ---- apply_patch block ----
+    if cell.lstrip().startswith("%%bash") and "apply_patch" in cell:
+        patch_lines: List[str] = []
+        capture = False
+        for ln in cell.splitlines():
+            if "apply_patch" in ln:
+                capture = False
+            if "<<\"EOF\"" in ln or ln.strip().endswith("<<EOF"):
+                capture = True
+                continue
+            if ln.strip() == "EOF" and capture:
+                break
+            if capture:
+                patch_lines.append(ln)
+        return _exec_apply_patch("\n".join(patch_lines))
 
-                if line_count >= LINE_LIMIT:
-                    truncated = True
-                    process.terminate()
-                    break
+    # ---- Mixed Jupyter‑style cell ----
+    py_buf: List[str] = []
+    outs, errs = [], []
 
-            return_code = process.wait()
-            output = ''.join(output_lines)
+    def flush_py():
+        if py_buf:
+            o, e = _exec_python("\n".join(py_buf))
+            outs.append(o)
+            errs.append(e)
+            py_buf.clear()
 
-            if truncated:
-                output += f"\n[Output truncated after {LINE_LIMIT} lines]"
-
-            return return_code, output
-
-        # Run the command with timeout
-        return run_with_timeout(run_command)
-    except TimeoutError:
-        return (1, f"Command timed out after {EXECUTION_TIMEOUT} seconds.")
-    except Exception as e:
-        return (1, f"Error executing command: {str(e)}")
-
-
-def run_command(cmd: str) -> str:
-    """
-    Run a shell command with timeout protection.
-
-    Args:
-        cmd: Command to execute
-
-    Returns:
-        Command output
-    """
-    try:
-        return_code, output = capture_output(cmd)
-        return output
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-class CaptureOutput:
-    """Capture stdout and stderr."""
-
-    def __init__(self):
-        self.stdout = io.StringIO()
-        self.stderr = io.StringIO()
-
-    def __enter__(self):
-        self.old_stdout = sys.stdout
-        self.old_stderr = sys.stderr
-        sys.stdout = self.stdout
-        sys.stderr = self.stderr
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout = self.old_stdout
-        sys.stderr = self.old_stderr
-
-    def get_output(self):
-        stdout_value = self.stdout.getvalue()
-        stderr_value = self.stderr.getvalue()
-        if stderr_value:
-            return stdout_value + "\n" + stderr_value
-        return stdout_value
-
-
-def get_or_create_interpreter():
-    """
-    Get or create a Python interpreter for stateful execution.
-
-    Returns:
-        code.InteractiveInterpreter: An interactive interpreter
-    """
-    global interpreter
-
-    if interpreter is None:
-        # Create a new interpreter with a fresh namespace
-        interpreter = code.InteractiveInterpreter()
-
-        # Initialize with some common imports - execute them one by one
-        for import_statement in [
-            "import sys",
-            "import os",
-            "import io",
-            "import traceback",
-            "from contextlib import redirect_stdout, redirect_stderr"
-        ]:
-            interpreter.runsource(import_statement)
-
-    return interpreter
-
-
-def execute_python_code(code_str: str):
-    """
-    Execute Python code in a way that can be run with timeout.
-    This is wrapped by execute_python_interpreter to handle timeouts.
-
-    Args:
-        code_str: Python code to execute
-
-    Returns:
-        Execution output
-    """
-    interpreter = get_or_create_interpreter()
-
-    with CaptureOutput() as output:
-        # Split the code into lines
-        lines = code_str.splitlines()
-
-        # Handle empty input
-        if not lines:
-            return ""
-
-        # Check if it's a single line or a multi-line block
-        if len(lines) == 1:
-            # Single line execution
-            more = interpreter.runsource(code_str)
-            if more:
-                return "Incomplete input. Please provide complete Python statements."
+    for ln in cell.splitlines():
+        if ln.lstrip().startswith("!"):
+            flush_py()
+            o, e = _exec_shell(ln.lstrip()[1:].lstrip())
+            outs.append(o)
+            errs.append(e)
         else:
-            # For multi-line code, execute it as a single unit
-            code_to_exec = compile(code_str, '<input>', 'exec')
-            exec(code_to_exec, interpreter.locals)
+            py_buf.append(ln)
+    flush_py()
 
-    return output.get_output()
+    return "".join(outs), "".join(errs)
+
+###############################################################################
+# Routes
+###############################################################################
+
+@app.route("/alive", methods=["GET"])
+def alive():
+    return "ok", 200
 
 
-def execute_python_interpreter(code_str: str) -> str:
-    """
-    Execute Python code in an interactive interpreter with timeout.
+@app.route("/execute", methods=["POST"])
+def execute():
+    overall_start = time.time()
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    payload = request.get_json()
+    if not isinstance(payload, list) or not payload:
+        return jsonify({"error": "Expected a non‑empty list of messages"}), 400
 
-    Args:
-        code_str: Python code to execute
-
-    Returns:
-        Execution output
-    """
-    global interpreter_lock
-
-    with interpreter_lock:  # Ensure thread safety
+    results = []
+    for idx, msg in enumerate(payload):
+        if msg.get("type") != "function_call" or msg.get("name") != "python":
+            continue
         try:
-            # Run the code execution with timeout
-            result = run_with_timeout(execute_python_code, args=(code_str,))
-            return result
-        except TimeoutError:
-            return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
-        except Exception as e:
-            return f"Error: {str(e)}\n{traceback.format_exc()}"
+            args = json.loads(msg.get("arguments", "{}"))
+        except json.JSONDecodeError as exc:
+            results.append({"index": idx, "output": "", "error": f"Bad JSON: {exc}", "timed_out": False, "duration": 0.0})
+            continue
+        code_inp = args.get("input")
+        if code_inp is None:
+            results.append({"index": idx, "output": "", "error": "'input' missing", "timed_out": False, "duration": 0.0})
+            continue
 
+        start = time.time()
+        out, err, timed = _run_with_timeout(_dispatch, 60, code_inp)
+        results.append({"index": idx, "output": out, "error": err, "timed_out": timed, "duration": round(time.time() - start, 3)})
 
-def handle_apply_patch(patch_text: str) -> str:
-    """
-    Apply a patch to the codebase.
+    if not results:
+        return jsonify({"error": "No python function_call messages found"}), 400
 
-    Args:
-        patch_text: Patch text in the specified format
+    return jsonify({"results": results, "overall_duration": round(time.time() - overall_start, 3)})
 
-    Returns:
-        Result of applying the patch
-    """
-    try:
-        result = process_patch(patch_text, open_file, write_file, remove_file)
-        return result
-    except Exception as e:
-        return f"Error applying patch: {str(e)}\n{traceback.format_exc()}"
-
-
-def process_input(input_text: str) -> str:
-    """
-    Process the input based on its type (Python code, shell command, or patch).
-
-    Args:
-        input_text: Input text to process
-
-    Returns:
-        Execution output
-    """
-    # Check if it's a bash apply_patch command
-    if input_text.startswith("%%bash\napply_patch"):
-        # Extract the patch text
-        pattern = r'apply_patch <<"EOF"\n(.*?)\nEOF'
-        match = re.search(pattern, input_text, re.DOTALL)
-        if match:
-            patch_text = match.group(1)
-            return handle_apply_patch(patch_text)
-        else:
-            return "Error: Invalid apply_patch format"
-
-    # Check if it's a shell command (either with ! or %%bash)
-    if input_text.startswith("!"):
-        cmd = input_text[1:]
-        return run_command(cmd)
-    elif input_text.startswith("%%bash"):
-        cmd = input_text[len("%%bash\n"):]
-        return run_command(cmd)
-
-    # Check if it's a special cell magic
-    if input_text.startswith("%%"):
-        magic_type = input_text.split("\n")[0]
-        return f"Magic command {magic_type} is not supported."
-
-    # Otherwise, assume it's Python code
-    return execute_python_interpreter(input_text)
-
-
-def parse_agent_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Parse an agent message to extract function calls.
-
-    Args:
-        message: Agent message dictionary
-
-    Returns:
-        Extracted function call if present, None otherwise
-    """
-    if message.get('type') == 'function_call':
-        return {
-            'name': message.get('name'),
-            'arguments': message.get('arguments'),
-            'call_id': message.get('call_id')
-        }
-    return None
-
-
-def handle_agent_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Handle an agent request by executing the requested action.
-
-    Args:
-        request_data: Request data containing the agent message
-
-    Returns:
-        Result of the execution
-    """
-    messages = request_data.get('messages', [])
-
-    # Find the last function call in the messages
-    function_call = None
-    for message in reversed(messages):
-        call = parse_agent_message(message)
-        if call:
-            function_call = call
-            break
-
-    if not function_call:
-        return {
-            'error': 'No function call found in messages'
-        }
-
-    # Currently, we only support the 'python' function
-    if function_call['name'] == 'python':
-        try:
-            arguments = json.loads(function_call['arguments'])
-            input_text = arguments.get('input', '')
-            output = process_input(input_text)
-
-            return {
-                'call_id': function_call['call_id'],
-                'content': output,
-                'status': 'success'
-            }
-        except Exception as e:
-            return {
-                'call_id': function_call['call_id'],
-                'error': str(e),
-                'status': 'error'
-            }
-    else:
-        return {
-            'call_id': function_call['call_id'],
-            'error': f"Unsupported function: {function_call['name']}",
-            'status': 'error'
-        }
-
-
-def main():
-    """
-    Main entry point for the server.
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Execute Python code or terminal commands in a stateful environment')
-    parser.add_argument('--port', type=int, default=4444, help='Port to listen on')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to')
-    args = parser.parse_args()
-
-    # Initialize the interpreter on startup
-    get_or_create_interpreter()
-    print(f"Python interpreter initialized")
-
-    # For simplicity, we'll use Flask for the web server
-    try:
-        from flask import Flask, request, jsonify
-
-        app = Flask(__name__)
-
-        @app.route('/execute', methods=['POST'])
-        def execute():
-            request_data = request.json
-            result = handle_agent_request(request_data)
-            return jsonify(result)
-
-        print(f"Server running on {args.host}:{args.port}")
-        app.run(host=args.host, port=args.port)
-
-    except ImportError as e:
-        print(f"Flask is not installed. Please install it with 'pip install flask'")
-        sys.exit(1)
-
+###############################################################################
+# Entrypoint
+###############################################################################
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
