@@ -149,14 +149,15 @@ def get_or_create_interpreter():
         # Create a new interpreter with a fresh namespace
         interpreter = code.InteractiveInterpreter()
 
-        # Initialize with some common imports
-        interpreter.runsource("""
-import sys
-import os
-import io
-import traceback
-from contextlib import redirect_stdout, redirect_stderr
-        """)
+        # Initialize with some common imports - execute them one by one
+        for import_statement in [
+            "import sys",
+            "import os",
+            "import io",
+            "import traceback",
+            "from contextlib import redirect_stdout, redirect_stderr"
+        ]:
+            interpreter.runsource(import_statement)
 
     return interpreter
 
@@ -179,12 +180,35 @@ def execute_python_interpreter(code_str: str) -> str:
         with CaptureOutput() as output:
             try:
                 with time_limit(EXECUTION_TIMEOUT):
-                    # Execute the code
-                    more = interpreter.runsource(code_str)
+                    # Split the code into lines and execute them as a cohesive unit
+                    lines = code_str.splitlines()
 
-                    # If more is True, the input is incomplete
-                    if more:
-                        return "Incomplete input. Please provide complete Python statements."
+                    # Handle empty input
+                    if not lines:
+                        return ""
+
+                    # Check if it's a single line or a multi-line block
+                    if len(lines) == 1:
+                        # Single line execution
+                        more = interpreter.runsource(code_str)
+                        if more:
+                            return "Incomplete input. Please provide complete Python statements."
+                    else:
+                        # For multi-line code, create a temporary file and execute it
+                        fd, path = tempfile.mkstemp(suffix='.py')
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                f.write(code_str)
+
+                            # Create a temporary namespace for execution
+                            namespace = {}
+
+                            # Execute the file in the interpreter's namespace
+                            with open(path, 'r') as f:
+                                code_content = f.read()
+                                interpreter.runsource(f"exec('''{code_content}''')")
+                        finally:
+                            os.unlink(path)  # Clean up the temporary file
             except TimeoutException:
                 return f"Execution timed out after {EXECUTION_TIMEOUT} seconds."
             except Exception as e:
