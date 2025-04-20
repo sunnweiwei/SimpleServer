@@ -87,10 +87,9 @@ for raw in sys.stdin:
 """))
 
 
-# Factory to spawn the sandbox REPL
-def _start_repl() -> subprocess.Popen:
+def _start_repl() -> subprocess.Popen[str]:
     return subprocess.Popen(
-        [str(SANDBOX_PREFIX / "bin" / "python"), "-u", str(_REPL_PATH)],
+        [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -100,10 +99,8 @@ def _start_repl() -> subprocess.Popen:
         bufsize=1,
     )
 
-
-# Initialize the REPL once
+_PY_LOCK = threading.Lock()
 PY_REPL = _start_repl()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -166,36 +163,26 @@ def _exec_shell(cmd: str, cwd: Path) -> tuple[str, str]:
         return "".join(out_lines), "" if rc == 0 else f"exit {rc}"
 
 
-def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
-    """
-    Execute *src* in the persistent Python REPL.
-    Auto‑restarts if the REPL process has exited or on BrokenPipeError.
-    Returns (stdout, stderr).
-    """
+def _exec_python(src: str, cwd: Path) -> tuple[str, str]:
     global PY_REPL
 
-    # Restart if the REPL died
-    if PY_REPL.poll() is not None:
-        PY_REPL = _start_repl()
-
-    msg = json.dumps({'code': src})
-
-    # Send code, retry once on BrokenPipeError
-    try:
+    def _send(code: str) -> tuple[str, str]:
+        msg = json.dumps({'code': code})
         PY_REPL.stdin.write(msg + "\n")
         PY_REPL.stdin.flush()
-    except BrokenPipeError:
-        PY_REPL = _start_repl()
-        PY_REPL.stdin.write(msg + "\n")
-        PY_REPL.stdin.flush()
+        resp = PY_REPL.stdout.readline()
+        data = json.loads(resp)            # {'out': ..., 'err': ...}
+        return data['out'], data['err']
 
-    # Read one JSON response line
-    resp = PY_REPL.stdout.readline()
-    try:
-        data = json.loads(resp)
-        return data.get('out', ''), data.get('err', '')
-    except Exception:
-        return '', 'Invalid REPL response'
+    with _PY_LOCK:
+        if PY_REPL.poll() is not None:
+            PY_REPL = _start_repl()
+        try:
+            return _send(src)
+        except (BrokenPipeError, OSError):
+            # Broken pipe → restart once and retry
+            PY_REPL = _start_repl()
+            return _send(src)
 
 
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
