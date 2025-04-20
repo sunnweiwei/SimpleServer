@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import io
@@ -27,7 +26,7 @@ SANDBOX_PREFIX = Path("/opt/miniconda3/envs/testbed").resolve()
 if not (SANDBOX_PREFIX / "bin").exists():
     raise RuntimeError(f"Conda env not found at {SANDBOX_PREFIX}")
 proc_env = subprocess.run(
-    ["/bin/bash", "-lc", 
+    ["/bin/bash", "-lc",
      f"source /opt/miniconda3/etc/profile.d/conda.sh && conda activate {SANDBOX_PREFIX} && env"],
     stdout=subprocess.PIPE,
     text=True,
