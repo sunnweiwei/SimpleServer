@@ -167,20 +167,23 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     with _PY_LOCK:
         if PY_REPL.poll() is not None:
             PY_REPL = _start_repl()
+
         PY_REPL.stdin.write(msg + "\n")
         PY_REPL.stdin.flush()
 
-        # keep reading until valid JSON arrives
         while True:
             resp = PY_REPL.stdout.readline()
-            if not resp:
-                PY_REPL = _start_repl()
-                return "", "REPL crashed"
-            try:
-                data = json.loads(resp)
-                return data["out"], data["err"]
-            except json.JSONDecodeError:
-                continue
+            if resp:
+                try:
+                    data = json.loads(resp)
+                    return data["out"], data["err"]
+                except json.JSONDecodeError:
+                    continue
+
+            # if stdout is closed, grab stderr to see why it died
+            err_text = PY_REPL.stderr.read() or "(no stderr output)"
+            PY_REPL = _start_repl()
+            return "", f"REPL crashed:\n{err_text}"
 
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
     res: Dict[int, str] = {}
