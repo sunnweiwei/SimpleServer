@@ -112,8 +112,13 @@ PY_REPL = _start_repl()
 #  Jupyter kernel (new, stateful, full notebook semantics)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _start_kernel() -> Tuple[KernelManager, "BlockingKernelClient"]:
-    km = KernelManager(kernel_name="python3")
+def _start_kernel():
+    python_exe = SANDBOX_PREFIX / "bin" / "python"       # /opt/…/testbed/bin/python
+    km = KernelManager(
+        kernel_name="",                                  # leave empty
+        kernel_cmd=[str(python_exe),
+                    "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+    )
     km.start_kernel(cwd=str(DEFAULT_ROOT), env=_SANDBOX_ENV)
     kc = km.client()
     kc.start_channels()
