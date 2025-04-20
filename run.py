@@ -37,7 +37,7 @@ for line in proc_env.stdout.splitlines():
     k, _, v = line.partition("=")
     _SANDBOX_ENV[k] = v
 # ensure PATH
-_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH','')}"
+_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH', '')}"
 
 # Default working directory
 DEFAULT_ROOT = Path("/testbed").resolve()
@@ -48,20 +48,26 @@ SERVER_FILE = Path(__file__).resolve().as_posix()
 # Flask app
 app = Flask(__name__)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Stateful shell process
 # ─────────────────────────────────────────────────────────────────────────────
-SHELL_PROC = subprocess.Popen(
-    ["/bin/bash"],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    cwd=DEFAULT_ROOT,
-    env=_SANDBOX_ENV,
-    text=True,
-    bufsize=1,
-    executable="/bin/bash"
-)
+def _start_shell():
+    return subprocess.Popen(
+        ["/bin/bash"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=DEFAULT_ROOT,
+        env=_SANDBOX_ENV,
+        text=True,
+        bufsize=1,
+        executable="/bin/bash"
+    )
+
+
+# Initialize shell
+SHELL_PROC = _start_shell()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stateful Python REPL process
@@ -85,16 +91,25 @@ for raw in sys.stdin:
     sys.stdout.write(json.dumps({'out': outbuf.getvalue(), 'err': errbuf.getvalue()}) + '\n')
     sys.stdout.flush()
 """))
-PY_REPL = subprocess.Popen(
-    [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    cwd=DEFAULT_ROOT,
-    env=_SANDBOX_ENV,
-    text=True,
-    bufsize=1
-)
+
+
+# Factory to spawn the sandbox REPL
+def _start_repl() -> subprocess.Popen:
+    return subprocess.Popen(
+        [str(SANDBOX_PREFIX / "bin" / "python"), "-u", str(_REPL_PATH)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=DEFAULT_ROOT,
+        env=_SANDBOX_ENV,
+        text=True,
+        bufsize=1,
+    )
+
+
+# Initialize the REPL once
+PY_REPL = _start_repl()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -106,14 +121,17 @@ def _clean_trace(tb: str) -> str:
         if SERVER_FILE not in ln and "/flask/" not in ln
     )
 
+
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
     res, err = {}, {}
+
     def _target():
         try:
             o, e = fn(*args)
             res[0], err[0] = o, e
         except Exception:
             err[0] = _clean_trace(traceback.format_exc())
+
     th = threading.Thread(target=_target, daemon=True)
     th.start()
     th.join(timeout)
@@ -121,37 +139,87 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
         return "", "Timed out", True
     return res.get(0, ""), err.get(0, ""), False
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dispatchers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _exec_shell(cmd: str, cwd: Path) -> Tuple[str, str]:
+# Then replace your _exec_shell with this version:
+def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, merge: bool = False) -> Tuple[str, str, int]:
+    """
+    Run *cmd* in the persistent shell, auto‐restarting on BrokenPipeError,
+    and return (stdout, stderr, returncode).
+    """
+    global SHELL_PROC
+
+    # If the shell died, restart it
+    if SHELL_PROC.poll() is not None:
+        SHELL_PROC = _start_shell()
+
+    # Use a marker so we know when the command’s done
     marker = uuid.uuid4().hex
     full = f"cd {cwd}\n{cmd}\necho {marker}$?\n"
-    SHELL_PROC.stdin.write(full)
-    SHELL_PROC.stdin.flush()
+
+    # Send the command, restarting once on BrokenPipe
+    try:
+        SHELL_PROC.stdin.write(full)
+        SHELL_PROC.stdin.flush()
+    except BrokenPipeError:
+        SHELL_PROC = _start_shell()
+        SHELL_PROC.stdin.write(full)
+        SHELL_PROC.stdin.flush()
+
+    # Read until we see our marker
     out_lines = []
+    rc = -1
     while True:
         line = SHELL_PROC.stdout.readline()
         if not line:
             break
         if line.startswith(marker):
-            rc = int(line[len(marker):].strip())
+            try:
+                rc = int(line[len(marker):].strip())
+            except ValueError:
+                rc = -1
             break
         out_lines.append(line)
-    return ''.join(out_lines), '' if rc==0 else f'Exit {rc}'
+
+    out = "".join(out_lines)
+    err = "" if rc == 0 else f"Exit {rc}"
+    return out, err, rc
 
 
 def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
+    """
+    Execute *src* in the persistent Python REPL.
+    Auto‑restarts if the REPL process has exited or on BrokenPipeError.
+    Returns (stdout, stderr).
+    """
+    global PY_REPL
+
+    # Restart if the REPL died
+    if PY_REPL.poll() is not None:
+        PY_REPL = _start_repl()
+
     msg = json.dumps({'code': src})
-    PY_REPL.stdin.write(msg + "\n")
-    PY_REPL.stdin.flush()
+
+    # Send code, retry once on BrokenPipeError
+    try:
+        PY_REPL.stdin.write(msg + "\n")
+        PY_REPL.stdin.flush()
+    except BrokenPipeError:
+        PY_REPL = _start_repl()
+        PY_REPL.stdin.write(msg + "\n")
+        PY_REPL.stdin.flush()
+
+    # Read one JSON response line
     resp = PY_REPL.stdout.readline()
     try:
         data = json.loads(resp)
-        return data['out'], data['err']
+        return data.get('out', ''), data.get('err', '')
     except Exception:
         return '', 'Invalid REPL response'
+
 
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     os.chdir(cwd)
@@ -163,6 +231,7 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     except Exception:
         return '', _clean_trace(traceback.format_exc())
 
+
 # Cell handler mixing !shell and Python
 
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
@@ -172,7 +241,8 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
         lines, cap, patch = cell.splitlines(), False, []
         for ln in lines:
             if '<<"EOF"' in ln or ln.strip().endswith('<<EOF'):
-                cap = True; continue
+                cap = True;
+                continue
             if ln.strip() == 'EOF' and cap:
                 break
             if cap:
@@ -183,10 +253,12 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     for ln in cell.splitlines():
         if ln.lstrip().startswith('!'):
             o, e = _exec_shell(ln.lstrip()[1:].lstrip(), cwd)
-            out_buf += o; err_buf += e
+            out_buf += o;
+            err_buf += e
         else:
             o, e = _exec_python(ln, cwd)
-            out_buf += o; err_buf += e
+            out_buf += o;
+            err_buf += e
     return out_buf, err_buf
 
 
