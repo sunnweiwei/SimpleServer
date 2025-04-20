@@ -152,14 +152,11 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
         )
         return out + "\n", ""
     except Exception:
-        tb = traceback.format_exc().splitlines()
-        clean = [ln for ln in tb if SERVER_FILE not in ln]
-        return "", "\n".join(clean)
+        return "", traceback.format_exc()
 
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     global PY_REPL
-    cell = textwrap.dedent(cell)
-
+    # cell = textwrap.dedent(cell)
     lines = cell.splitlines()
     i = 0
     while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith("#")):
