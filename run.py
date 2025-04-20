@@ -75,6 +75,12 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
         start = time.time()
         while True:
             if timeout and (time.time() - start) > timeout:
+                # On timeout, kill and restart the shell to clear stuck processes
+                try:
+                    SHELL_PROC.kill()
+                except Exception:
+                    pass
+                SHELL_PROC = _start_shell()
                 return "", "Timed out", -9
             line = SHELL_PROC.stdout.readline()
             if not line:
@@ -85,6 +91,7 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
                 break
             out_lines.append(line)
         return "".join(out_lines), "" if rc == 0 else f"exit {rc}", rc
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) IPython‑based REPL
@@ -186,6 +193,7 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
             return "", f"REPL crashed:\n{err_text}"
 
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
+    global SHELL_PROC, PY_REPL
     res: Dict[int, str] = {}
     err: Dict[int, str] = {}
 
@@ -200,6 +208,17 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
     th.start()
     th.join(timeout)
     if th.is_alive():
+        # On timeout, kill and restart both the shell and REPL
+        try:
+            SHELL_PROC.kill()
+        except Exception:
+            pass
+        SHELL_PROC = _start_shell()
+        try:
+            PY_REPL.kill()
+        except Exception:
+            pass
+        PY_REPL = _start_repl()
         return "", "Timed out", True
     return res.get(0, ""), err.get(0, ""), False
 
