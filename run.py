@@ -1,26 +1,17 @@
+```python
 from __future__ import annotations
-
-"""Flask server for SWE‑Bench automation.
-
-Highlights
-==========
-* Workdir defaults to `/testbed` (override per‑request).
-* Execute mixed Python / `!shell` cells (`/execute`).
-* Generate cleaned git diff (`/diff`).
-* Apply patch & run evaluation script (`/evaluate`).
-* **NEW** Run arbitrary shell command (`/command`).
-* All stack traces cleaned of server internals.
-"""
 
 import io
 import json
 import os
 import subprocess
 import tempfile
-import textwrap
 import threading
 import time
 import traceback
+import textwrap
+import uuid
+from code import InteractiveConsole
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -28,49 +19,87 @@ from typing import Any, Dict, List, Tuple
 from flask import Flask, jsonify, request
 
 import apply_patch
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Capture fully activated conda env once
+# Bootstrap: capture fully activated conda env once
 # ─────────────────────────────────────────────────────────────────────────────
 SANDBOX_PREFIX = Path("/opt/miniconda3/envs/testbed").resolve()
 if not (SANDBOX_PREFIX / "bin").exists():
     raise RuntimeError(f"Conda env not found at {SANDBOX_PREFIX}")
-
-# Activate and capture env
-proc = subprocess.run(
-    [
-        "/bin/bash", "-lc",
-        f"source /opt/miniconda3/etc/profile.d/conda.sh && conda activate {SANDBOX_PREFIX} && env"
-    ],
+proc_env = subprocess.run(
+    ["/bin/bash", "-lc", 
+     f"source /opt/miniconda3/etc/profile.d/conda.sh && conda activate {SANDBOX_PREFIX} && env"],
     stdout=subprocess.PIPE,
     text=True,
     check=True
 )
 _SANDBOX_ENV: Dict[str, str] = {}
-for line in proc.stdout.splitlines():
-    key, _, val = line.partition("=")
-    _SANDBOX_ENV[key] = val
-
-# Ensure PATH includes sandbox bin
-_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH', '')}"
+for line in proc_env.stdout.splitlines():
+    k, _, v = line.partition("=")
+    _SANDBOX_ENV[k] = v
+# ensure PATH
+_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH','')}"
 
 # Default working directory
 DEFAULT_ROOT = Path("/testbed").resolve()
-if not DEFAULT_ROOT.exists():
-    DEFAULT_ROOT.mkdir(parents=True, exist_ok=True)
+DEFAULT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Reference to this file for trace-cleaning
 SERVER_FILE = Path(__file__).resolve().as_posix()
 
 # Flask app
 app = Flask(__name__)
 
-# Shared globals for Python exec
-_EXEC_GLOBALS: Dict[str, Any] = {"__name__": "__main__", "__file__": "<agent>"}
+# ─────────────────────────────────────────────────────────────────────────────
+# Stateful shell process
+# ─────────────────────────────────────────────────────────────────────────────
+SHELL_PROC = subprocess.Popen(
+    ["/bin/bash"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    cwd=DEFAULT_ROOT,
+    env=_SANDBOX_ENV,
+    text=True,
+    bufsize=1,
+    executable="/bin/bash"
+)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Stateful Python REPL process
+# ─────────────────────────────────────────────────────────────────────────────
+# Write small REPL script
+_REPL_PATH = Path(tempfile.gettempdir()) / "python_repl.py"
+_REPL_PATH.write_text(textwrap.dedent("""
+import sys, json, io, traceback
+from code import InteractiveConsole
+from contextlib import redirect_stdout, redirect_stderr
+console = InteractiveConsole(globals())
+for raw in sys.stdin:
+    try:
+        msg = json.loads(raw)
+        src = msg.get('code', '')
+        outbuf, errbuf = io.StringIO(), io.StringIO()
+        with redirect_stdout(outbuf), redirect_stderr(errbuf):
+            console.runsource(src)
+    except Exception:
+        errbuf.write(traceback.format_exc())
+    sys.stdout.write(json.dumps({'out': outbuf.getvalue(), 'err': errbuf.getvalue()}) + '\n')
+    sys.stdout.flush()
+"""))
+PY_REPL = subprocess.Popen(
+    [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    cwd=DEFAULT_ROOT,
+    env=_SANDBOX_ENV,
+    text=True,
+    bufsize=1
+)
 
-###############################################################################
-# Utility – error‑trace cleaner
-###############################################################################
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _clean_trace(tb: str) -> str:
     return "\n".join(
@@ -78,116 +107,88 @@ def _clean_trace(tb: str) -> str:
         if SERVER_FILE not in ln and "/flask/" not in ln
     )
 
-
-###############################################################################
-# Low‑level executors
-###############################################################################
-def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, merge: bool = False) -> Tuple[str, str, int]:
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if merge else subprocess.PIPE,
-        env=_SANDBOX_ENV,
-        executable='/bin/bash'
-    )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return "", "Timed out", -9
-    if proc.returncode and not merge:
-        err = _clean_trace(err or f"Exit {proc.returncode}")
-    if merge:
-        return out, "", proc.returncode
-    return out, err, proc.returncode
-
-
-def _exec_python(src: str, cwd: Path, merge: bool = True) -> Tuple[str, str]:
-    with tempfile.NamedTemporaryFile('w', suffix='.py', dir=str(cwd), delete=False) as tmp:
-        tmp.write(src)
-        path = Path(tmp.name)
-    try:
-        out, err, _ = _exec_shell(f"{_SANDBOX_ENV.get('CONDA_PREFIX')}/bin/python {path.name}", cwd, merge=merge)
-        return out, err
-    finally:
-        path.unlink(missing_ok=True)
-
-
-def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
-    os.chdir(cwd)
-    try:
-        res = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file)
-        return res + "\n", ""
-    except Exception:
-        return "", _clean_trace(traceback.format_exc())
-
-
-###############################################################################
-# Timeout wrapper for dispatch cells
-###############################################################################
-
-def _run_with_timeout(fn, timeout: int, *args, **kwargs) -> Tuple[str, str, bool]:
-    result, err = {}, {}
-
+def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
+    res, err = {}, {}
     def _target():
         try:
-            o, e = fn(*args, **kwargs)
-            result[0], err[0] = o, e
+            o, e = fn(*args)
+            res[0], err[0] = o, e
         except Exception:
             err[0] = _clean_trace(traceback.format_exc())
-
     th = threading.Thread(target=_target, daemon=True)
     th.start()
     th.join(timeout)
     if th.is_alive():
         return "", "Timed out", True
-    return result.get(0, ""), err.get(0, ""), False
+    return res.get(0, ""), err.get(0, ""), False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatchers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _exec_shell(cmd: str, cwd: Path) -> Tuple[str, str]:
+    marker = uuid.uuid4().hex
+    full = f"cd {cwd}\n{cmd}\necho {marker}$?\n"
+    SHELL_PROC.stdin.write(full)
+    SHELL_PROC.stdin.flush()
+    out_lines = []
+    while True:
+        line = SHELL_PROC.stdout.readline()
+        if not line:
+            break
+        if line.startswith(marker):
+            rc = int(line[len(marker):].strip())
+            break
+        out_lines.append(line)
+    return ''.join(out_lines), '' if rc==0 else f'Exit {rc}'
 
 
-###############################################################################
-# Mixed‑cell dispatcher
-###############################################################################
+def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
+    msg = json.dumps({'code': src})
+    PY_REPL.stdin.write(msg + "\n")
+    PY_REPL.stdin.flush()
+    resp = PY_REPL.stdout.readline()
+    try:
+        data = json.loads(resp)
+        return data['out'], data['err']
+    except Exception:
+        return '', 'Invalid REPL response'
+
+def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
+    os.chdir(cwd)
+    try:
+        res = apply_patch.process_patch(
+            block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file
+        )
+        return res + '\n', ''
+    except Exception:
+        return '', _clean_trace(traceback.format_exc())
+
+# Cell handler mixing !shell and Python
 
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     cell = textwrap.dedent(cell)
-
-    # apply_patch block
-    if cell.lstrip().startswith("%%bash") and "apply_patch" in cell:
-        patch_lines, cap = [], False
-        for ln in cell.splitlines():
-            if "apply_patch" in ln:
-                cap = False
-            if "<<\"EOF\"" in ln or ln.strip().endswith("<<EOF"):
-                cap = True
-                continue
-            if ln.strip() == "EOF" and cap:
+    # apply_patch
+    if cell.lstrip().startswith('%%bash') and 'apply_patch' in cell:
+        lines, cap, patch = cell.splitlines(), False, []
+        for ln in lines:
+            if '<<"EOF"' in ln or ln.strip().endswith('<<EOF'):
+                cap = True; continue
+            if ln.strip() == 'EOF' and cap:
                 break
             if cap:
-                patch_lines.append(ln)
-        return _exec_apply_patch("\n".join(patch_lines), cwd)
-
-    py_buf, outs, errs = [], [], []
-
-    def flush_py():
-        if py_buf:
-            o, e = _exec_python("\n".join(py_buf), cwd)
-            outs.append(o)
-            errs.append(e)
-            py_buf.clear()
-
+                patch.append(ln)
+        return _exec_apply_patch("\n".join(patch), cwd)
+    # mixed execution
+    out_buf, err_buf = '', ''
     for ln in cell.splitlines():
-        if ln.lstrip().startswith("!"):
-            flush_py()
-            o, e, _ = _exec_shell(ln.lstrip()[1:].lstrip(), cwd)
-            outs.append(o)
-            errs.append(e)
+        if ln.lstrip().startswith('!'):
+            o, e = _exec_shell(ln.lstrip()[1:].lstrip(), cwd)
+            out_buf += o; err_buf += e
         else:
-            py_buf.append(ln)
-    flush_py()
-    return "".join(outs), "".join(errs)
+            o, e = _exec_python(ln, cwd)
+            out_buf += o; err_buf += e
+    return out_buf, err_buf
 
 
 ###############################################################################
