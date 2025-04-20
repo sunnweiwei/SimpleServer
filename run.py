@@ -225,7 +225,7 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
     print(eval_out)
     print('=' * 30)
     print(eval_err)
-    report['eval_output'] = eval_out + eval_err
+    report['eval_output'] = eval_out
     if rc == -9:
         report['test_timeout'] = True
         return report
