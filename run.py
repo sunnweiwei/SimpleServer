@@ -282,6 +282,7 @@ def execute_endpoint():
             continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
+        print(err)
         results.append({'index': idx, 'call_id': msg.get('call_id'), 'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
     if not results:
         return jsonify({'error': 'No python function_call messages found'}), 400
