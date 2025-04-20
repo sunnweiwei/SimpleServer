@@ -52,22 +52,16 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Stateful shell process
 # ─────────────────────────────────────────────────────────────────────────────
-def _start_shell():
+# util at module level
+def _start_shell() -> subprocess.Popen[str]:
     return subprocess.Popen(
         ["/bin/bash"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=DEFAULT_ROOT,
-        env=_SANDBOX_ENV,
-        text=True,
-        bufsize=1,
-        executable="/bin/bash"
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=DEFAULT_ROOT, env=_SANDBOX_ENV, text=True, bufsize=1
     )
 
-
-# Initialize shell
-SHELL_PROC = _start_shell()
+SHELL_PROC = _start_shell()             # initial launch
+SHELL_LOCK = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stateful Python REPL process
@@ -144,49 +138,32 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
 # Dispatchers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Then replace your _exec_shell with this version:
-def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, merge: bool = False) -> Tuple[str, str, int]:
-    """
-    Run *cmd* in the persistent shell, auto‐restarting on BrokenPipeError,
-    and return (stdout, stderr, returncode).
-    """
+def _exec_shell(cmd: str, cwd: Path) -> tuple[str, str]:
     global SHELL_PROC
+    with SHELL_LOCK:
+        if SHELL_PROC.poll() is not None:            # bash died → restart
+            SHELL_PROC = _start_shell()
+        marker = uuid.uuid4().hex
+        try:
+            SHELL_PROC.stdin.write(f"cd {cwd}\n{cmd}\necho {marker}$?\n")
+            SHELL_PROC.stdin.flush()
+        except (BrokenPipeError, IOError):
+            # one more restart attempt
+            SHELL_PROC = _start_shell()
+            SHELL_PROC.stdin.write(f"cd {cwd}\n{cmd}\necho {marker}$?\n")
+            SHELL_PROC.stdin.flush()
 
-    # If the shell died, restart it
-    if SHELL_PROC.poll() is not None:
-        SHELL_PROC = _start_shell()
-
-    # Use a marker so we know when the command’s done
-    marker = uuid.uuid4().hex
-    full = f"cd {cwd}\n{cmd}\necho {marker}$?\n"
-
-    # Send the command, restarting once on BrokenPipe
-    try:
-        SHELL_PROC.stdin.write(full)
-        SHELL_PROC.stdin.flush()
-    except BrokenPipeError:
-        SHELL_PROC = _start_shell()
-        SHELL_PROC.stdin.write(full)
-        SHELL_PROC.stdin.flush()
-
-    # Read until we see our marker
-    out_lines = []
-    rc = -1
-    while True:
-        line = SHELL_PROC.stdout.readline()
-        if not line:
-            break
-        if line.startswith(marker):
-            try:
+        out_lines: list[str] = []
+        while True:
+            line = SHELL_PROC.stdout.readline()
+            if not line:                       # bash exited unexpectedly
+                SHELL_PROC = _start_shell()    # restart for next call
+                return "", "shell crashed", -1
+            if line.startswith(marker):
                 rc = int(line[len(marker):].strip())
-            except ValueError:
-                rc = -1
-            break
-        out_lines.append(line)
-
-    out = "".join(out_lines)
-    err = "" if rc == 0 else f"Exit {rc}"
-    return out, err, rc
+                break
+            out_lines.append(line)
+        return "".join(out_lines), "" if rc == 0 else f"exit {rc}"
 
 
 def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
