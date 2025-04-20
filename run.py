@@ -156,7 +156,6 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
 
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     global PY_REPL
-    # cell = textwrap.dedent(cell)
     lines = cell.splitlines()
     i = 0
     while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith("#")):
@@ -336,16 +335,19 @@ def execute_endpoint():
         try:
             args = json.loads(msg.get('arguments', '{}'))
         except json.JSONDecodeError as exc:
-            results.append({'index': idx, 'call_id': msg.get('call_id'), 'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
+            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': msg, 
+                            'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
             continue
         code = args.get('input')
         if code is None:
-            results.append({'index': idx, 'call_id': msg.get('call_id'), 'output': '', 'error': "'input' missing", 'timed_out': False, 'duration': 0.0})
+            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code, 
+                            'output': '', 'error': "'input' missing", 'timed_out': False, 'duration': 0.0})
             continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
         print(err)
-        results.append({'index': idx, 'call_id': msg.get('call_id'), 'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
+        results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code, 
+                        'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
     if not results:
         return jsonify({'error': 'No python function_call messages found'}), 400
     return jsonify({'results': results, 'overall_duration': round(time.time() - start, 3)})
