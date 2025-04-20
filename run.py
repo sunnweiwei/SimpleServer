@@ -28,28 +28,44 @@ from typing import Any, Dict, List, Tuple
 from flask import Flask, jsonify, request
 
 import apply_patch
+# ─────────────────────────────────────────────────────────────────────────────
+# Capture fully activated conda env once
+# ─────────────────────────────────────────────────────────────────────────────
+SANDBOX_PREFIX = Path("/opt/miniconda3/envs/testbed").resolve()
+if not (SANDBOX_PREFIX / "bin").exists():
+    raise RuntimeError(f"Conda env not found at {SANDBOX_PREFIX}")
 
-###############################################################################
-# Environment / constants
-###############################################################################
+# Activate and capture env
+proc = subprocess.run(
+    [
+        "/bin/bash", "-lc",
+        f"source /opt/miniconda3/etc/profile.d/conda.sh && conda activate {SANDBOX_PREFIX} && env"
+    ],
+    stdout=subprocess.PIPE,
+    text=True,
+    check=True
+)
+_SANDBOX_ENV: Dict[str, str] = {}
+for line in proc.stdout.splitlines():
+    key, _, val = line.partition("=")
+    _SANDBOX_ENV[key] = val
 
+# Ensure PATH includes sandbox bin
+_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH', '')}"
+
+# Default working directory
 DEFAULT_ROOT = Path("/testbed").resolve()
+if not DEFAULT_ROOT.exists():
+    DEFAULT_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Reference to this file for trace-cleaning
 SERVER_FILE = Path(__file__).resolve().as_posix()
 
-###############################################################################
-# Flask setup
-###############################################################################
-
+# Flask app
 app = Flask(__name__)
 
-###############################################################################
-# Shared Python execution context
-###############################################################################
-
-_EXEC_GLOBALS: Dict[str, Any] = {
-    "__name__": "__main__",
-    "__file__": "<agent>",
-}
+# Shared globals for Python exec
+_EXEC_GLOBALS: Dict[str, Any] = {"__name__": "__main__", "__file__": "<agent>"}
 
 
 ###############################################################################
@@ -66,50 +82,38 @@ def _clean_trace(tb: str) -> str:
 ###############################################################################
 # Low‑level executors
 ###############################################################################
-PY_BIN = Path('/opt/miniconda3/envs/testbed/bin/python')  # dedicated sandbox interpreter
-
-
-def _exec_python(src: str, cwd: Path, *, merge: bool = True) -> Tuple[str, str]:
-    """Execute *src* with the sandbox Python (env: /opt/miniconda3/envs/testbed).
-
-    Code is written to a temporary file in *cwd* then executed via subprocess so
-    it does **not** inherit the server's Python environment.
-    If *merge* is True, stderr is merged into stdout to preserve ordering.
-    """
-    if not PY_BIN.exists():
-        return "", f"Python interpreter not found at {PY_BIN}",  # type: ignore
-
-    with tempfile.NamedTemporaryFile('w', suffix='.py', dir=str(cwd), delete=False) as tmp:
-        tmp.write(src)
-        tmp_path = Path(tmp.name)
-
-    try:
-        out, err, _ = _exec_shell(f'{PY_BIN} {tmp_path.name}', cwd, timeout=None, merge=merge)
-        return out, err
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, *, merge: bool = False) -> Tuple[str, str, int]:
-    """Execute *cmd* in *cwd*.
-
-    If *merge* is True, stdout and stderr are combined in order and returned as
-    `stdout` (stderr string will be empty). Otherwise they are captured
-    separately and order may differ.
-    """
-    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE)
+def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, merge: bool = False) -> Tuple[str, str, int]:
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+        env=_SANDBOX_ENV,
+        executable='/bin/bash'
+    )
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         return "", "Timed out", -9
-    if proc.returncode != 0 and not merge:
-        err = _clean_trace(err or f"Command exited with {proc.returncode}")
+    if proc.returncode and not merge:
+        err = _clean_trace(err or f"Exit {proc.returncode}")
     if merge:
-        # all output in *out*, keep err empty
         return out, "", proc.returncode
     return out, err, proc.returncode
+
+
+def _exec_python(src: str, cwd: Path, merge: bool = True) -> Tuple[str, str]:
+    with tempfile.NamedTemporaryFile('w', suffix='.py', dir=str(cwd), delete=False) as tmp:
+        tmp.write(src)
+        path = Path(tmp.name)
+    try:
+        out, err, _ = _exec_shell(f"{_SANDBOX_ENV.get('CONDA_PREFIX')}/bin/python {path.name}", cwd, merge=merge)
+        return out, err
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
