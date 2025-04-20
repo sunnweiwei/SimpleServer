@@ -67,15 +67,67 @@ def _clean_trace(tb: str) -> str:
 # Low‑level executors
 ###############################################################################
 
-def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
-    stdout, stderr = io.StringIO(), io.StringIO()
+# ─── persistent sandbox interpreter ────────────────────────────────────
+PY_BIN = Path("/opt/miniconda3/envs/testbed/bin/python")
+_PY_PROC: subprocess.Popen | None = None
+_PY_LOCK = threading.Lock()          # protect concurrent cell execution
+
+def _ensure_py_proc(cwd: Path) -> None:
+    """Spawn the sandbox python (once) with a tiny REPL that executes code
+    blocks sent over stdin.  Output is line‑buffered, stderr→stdout."""
+    global _PY_PROC
+    if _PY_PROC and _PY_PROC.poll() is None:
+        return
+
+    bootstrap = """
+import sys, traceback, json, builtins
+ns = {}
+print("__READY__", flush=True)
+while True:
+    hdr = sys.stdin.readline()
+    if not hdr:
+        break                          # EOF -> exit
+    if not hdr.startswith("__RUN__"):
+        continue
+    n = int(hdr.split()[1])
+    code = sys.stdin.read(n)
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            os.chdir(cwd)
-            exec(src, _EXEC_GLOBALS)  # nosec B102
+        exec(code, ns)
     except Exception:
-        stderr.write(_clean_trace(traceback.format_exc()))
-    return stdout.getvalue(), stderr.getvalue()
+        traceback.print_exc()
+    print("__END_RUN__", flush=True)
+"""
+    _PY_PROC = subprocess.Popen(
+        [PY_BIN, "-u", "-"],
+        cwd=cwd,
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,      # line‑buffered
+    )
+    _PY_PROC.stdin.write(bootstrap)
+    _PY_PROC.stdin.flush()
+    # wait for ready banner
+    _PY_PROC.stdout.readline()
+
+def _exec_python(src: str, cwd: Path) -> tuple[str, str]:
+    """Execute *src* in the persistent sandbox kernel."""
+    _ensure_py_proc(cwd)
+    token = f"__RUN__ {len(src)}\n"
+    with _PY_LOCK:                      # serialize cells
+        _PY_PROC.stdin.write(token + src)
+        _PY_PROC.stdin.flush()
+
+        out_lines = []
+        while True:
+            line = _PY_PROC.stdout.readline()
+            if not line:                # proc died
+                return "", "Sandbox python terminated unexpectedly"
+            if line.rstrip() == "__END_RUN__":
+                break
+            out_lines.append(line)
+    return "".join(out_lines), ""       # stderr already merged
 
 
 def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, *, merge: bool = False) -> Tuple[str, str, int]:
