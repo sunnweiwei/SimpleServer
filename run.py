@@ -160,25 +160,31 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     global PY_REPL
     cell = textwrap.dedent(cell)
 
-    # special: %%bash + apply_patch
-    if cell.lstrip().startswith("%%bash") and "apply_patch" in cell:
-        lines = cell.splitlines()
-        patch, cap = [], False
-        for ln in lines:
+    lines = cell.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith("#")):
+        i += 1
+    remainder = "\n".join(lines[i:])
+
+    # Special: %%bash + apply_patch after comments
+    if remainder.lstrip().startswith("%%bash") and "apply_patch" in cell:
+        patch_lines: List[str] = []
+        cap = False
+        for ln in remainder.splitlines():
             if '<<"EOF"' in ln or ln.strip().endswith("<<EOF"):
                 cap = True
                 continue
             if cap and ln.strip() == "EOF":
                 break
             if cap:
-                patch.append(ln)
-        return _exec_apply_patch("\n".join(patch), cwd)
+                patch_lines.append(ln)
+        return _exec_apply_patch("\n".join(patch_lines), cwd)
 
-    # otherwise, send raw cell to IPython REPL
+    # Otherwise, send raw cell to IPython REPL
     msg = json.dumps({"code": cell, "cwd": str(cwd)})
     with _PY_LOCK:
         if PY_REPL.poll() is not None:
-            PY_REPL = _start_repl()
+            globals()['PY_REPL'] = _start_repl()
 
         PY_REPL.stdin.write(msg + "\n")
         PY_REPL.stdin.flush()
@@ -192,9 +198,9 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
                 except json.JSONDecodeError:
                     continue
 
-            # if stdout is closed, grab stderr to see why it died
+            # If stdout closed unexpectedly, restart REPL
             err_text = PY_REPL.stderr.read() or "(no stderr output)"
-            PY_REPL = _start_repl()
+            globals()['PY_REPL'] = _start_repl()
             return "", f"REPL crashed:\n{err_text}"
 
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
@@ -227,6 +233,7 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
             pass
         return "", "Timed out", True
     return res.get(0, ""), err.get(0, ""), False
+
 
 # ─── Git‑patch & evaluation helpers (unchanged) ───────────────────────────────
 def _remove_binary_diffs(patch_text: str) -> str:
