@@ -66,68 +66,28 @@ def _clean_trace(tb: str) -> str:
 ###############################################################################
 # Low‑level executors
 ###############################################################################
+PY_BIN = Path('/opt/miniconda3/envs/testbed/bin/python')  # dedicated sandbox interpreter
 
-# ─── persistent sandbox interpreter ────────────────────────────────────
-PY_BIN = Path("/opt/miniconda3/envs/testbed/bin/python")
-_PY_PROC: subprocess.Popen | None = None
-_PY_LOCK = threading.Lock()          # protect concurrent cell execution
 
-def _ensure_py_proc(cwd: Path) -> None:
-    """Spawn the sandbox python (once) with a tiny REPL that executes code
-    blocks sent over stdin.  Output is line‑buffered, stderr→stdout."""
-    global _PY_PROC
-    if _PY_PROC and _PY_PROC.poll() is None:
-        return
+def _exec_python(src: str, cwd: Path, *, merge: bool = True) -> Tuple[str, str]:
+    """Execute *src* with the sandbox Python (env: /opt/miniconda3/envs/testbed).
 
-    bootstrap = """
-import sys, traceback, json, builtins
-ns = {}
-print("__READY__", flush=True)
-while True:
-    hdr = sys.stdin.readline()
-    if not hdr:
-        break                          # EOF -> exit
-    if not hdr.startswith("__RUN__"):
-        continue
-    n = int(hdr.split()[1])
-    code = sys.stdin.read(n)
+    Code is written to a temporary file in *cwd* then executed via subprocess so
+    it does **not** inherit the server's Python environment.
+    If *merge* is True, stderr is merged into stdout to preserve ordering.
+    """
+    if not PY_BIN.exists():
+        return "", f"Python interpreter not found at {PY_BIN}",  # type: ignore
+
+    with tempfile.NamedTemporaryFile('w', suffix='.py', dir=str(cwd), delete=False) as tmp:
+        tmp.write(src)
+        tmp_path = Path(tmp.name)
+
     try:
-        exec(code, ns)
-    except Exception:
-        traceback.print_exc()
-    print("__END_RUN__", flush=True)
-"""
-    _PY_PROC = subprocess.Popen(
-        [PY_BIN, "-u", "-"],
-        cwd=cwd,
-        text=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,      # line‑buffered
-    )
-    _PY_PROC.stdin.write(bootstrap)
-    _PY_PROC.stdin.flush()
-    # wait for ready banner
-    _PY_PROC.stdout.readline()
-
-def _exec_python(src: str, cwd: Path) -> tuple[str, str]:
-    """Execute *src* in the persistent sandbox kernel."""
-    _ensure_py_proc(cwd)
-    token = f"__RUN__ {len(src)}\n"
-    with _PY_LOCK:                      # serialize cells
-        _PY_PROC.stdin.write(token + src)
-        _PY_PROC.stdin.flush()
-
-        out_lines = []
-        while True:
-            line = _PY_PROC.stdout.readline()
-            if not line:                # proc died
-                return "", "Sandbox python terminated unexpectedly"
-            if line.rstrip() == "__END_RUN__":
-                break
-            out_lines.append(line)
-    return "".join(out_lines), ""       # stderr already merged
+        out, err, _ = _exec_shell(f'{PY_BIN} {tmp_path.name}', cwd, timeout=None, merge=merge)
+        return out, err
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, *, merge: bool = False) -> Tuple[str, str, int]:
