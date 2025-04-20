@@ -260,7 +260,9 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
         return report
 
     Path('/tmp/patch.diff').write_text(model_patch)
-    Path('/tmp/eval.sh').write_text(eval_script).chmod(0o755)
+    script_path = Path('/tmp/eval.sh')
+    script_path.write_text(eval_script)
+    script_path.chmod(0o755)
     cwd = workdir.resolve()
 
     apply_cmd = (
