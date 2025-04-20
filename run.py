@@ -145,9 +145,8 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     # otherwise send to IPython REPL
     msg = json.dumps({"code": cell, "cwd": str(cwd)})
     with _PY_LOCK:
+        global PY_REPL
         if PY_REPL.poll() is not None:
-            # restart on crash
-            global PY_REPL
             PY_REPL = _start_repl()
         PY_REPL.stdin.write(msg + "\n")
         PY_REPL.stdin.flush()
