@@ -334,7 +334,7 @@ def execute_endpoint():
     payload = request.get_json()
     results = []
     for idx, msg in enumerate(payload):
-        if msg.get('type') != 'function_call' or msg.get('name') != 'python':
+        if msg.get('type') != 'function_call' or msg.get('name') != 'python_bash_patch':
             continue
         try:
             args = json.loads(msg.get('arguments', '{}'))
