@@ -10,6 +10,7 @@ import time
 import traceback
 import textwrap
 import uuid
+import signal
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -61,10 +62,14 @@ SHELL_PROC = _start_shell()
 SHELL_LOCK = threading.Lock()
 
 def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int]:
-    global SHELL_PROC
+    """
+    Execute a shell command within a persistent bash process.
+    On timeout, only interrupt the running command, not the shell itself.
+    """
     with SHELL_LOCK:
         if SHELL_PROC.poll() is not None:
-            SHELL_PROC = _start_shell()
+            # Restart shell if it exited unexpectedly
+            globals()['SHELL_PROC'] = _start_shell()
 
         marker = uuid.uuid4().hex
         SHELL_PROC.stdin.write(f"cd {cwd}\n{cmd}\necho {marker}$?\n")
@@ -75,16 +80,16 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
         start = time.time()
         while True:
             if timeout and (time.time() - start) > timeout:
-                # On timeout, kill and restart the shell to clear stuck processes
+                # On timeout, interrupt the running command without killing the shell
                 try:
-                    SHELL_PROC.kill()
+                    SHELL_PROC.send_signal(signal.SIGINT)
                 except Exception:
                     pass
-                SHELL_PROC = _start_shell()
                 return "", "Timed out", -9
             line = SHELL_PROC.stdout.readline()
             if not line:
-                SHELL_PROC = _start_shell()
+                # Shell died; restart it
+                globals()['SHELL_PROC'] = _start_shell()
                 return "", "shell crashed", -1
             if line.startswith(marker):
                 rc = int(line[len(marker):].strip())
@@ -193,6 +198,9 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
             return "", f"REPL crashed:\n{err_text}"
 
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
+    """
+    Run fn(*args) with a timeout. On timeout, interrupt only the running command or cell.
+    """
     global SHELL_PROC, PY_REPL
     res: Dict[int, str] = {}
     err: Dict[int, str] = {}
@@ -208,17 +216,15 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
     th.start()
     th.join(timeout)
     if th.is_alive():
-        # On timeout, kill and restart both the shell and REPL
+        # On timeout, interrupt the running command/cell without killing the env
         try:
-            SHELL_PROC.kill()
+            SHELL_PROC.send_signal(signal.SIGINT)
         except Exception:
             pass
-        SHELL_PROC = _start_shell()
         try:
-            PY_REPL.kill()
+            PY_REPL.send_signal(signal.SIGINT)
         except Exception:
             pass
-        PY_REPL = _start_repl()
         return "", "Timed out", True
     return res.get(0, ""), err.get(0, ""), False
 
