@@ -17,29 +17,36 @@ from flask import Flask, jsonify, request
 
 import apply_patch
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment setup
+# ─────────────────────────────────────────────────────────────────────────────
 SANDBOX_PREFIX = Path("/opt/miniconda3/envs/testbed").resolve()
 if not (SANDBOX_PREFIX / "bin").exists():
     raise RuntimeError(f"Conda env not found at {SANDBOX_PREFIX}")
+
+# capture conda env
 proc_env = subprocess.run(
     ["/bin/bash", "-lc",
      f"source /opt/miniconda3/etc/profile.d/conda.sh && conda activate {SANDBOX_PREFIX} && env"],
-    stdout=subprocess.PIPE,
-    text=True,
-    check=True
+    stdout=subprocess.PIPE, text=True, check=True
 )
 _SANDBOX_ENV: Dict[str, str] = {}
 for line in proc_env.stdout.splitlines():
-    k, _, v = line.partition("=")
-    _SANDBOX_ENV[k] = v
-_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH', '')}"
+    key, _, val = line.partition("=")
+    _SANDBOX_ENV[key] = val
+# ensure PATH
+_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH','')}"
 
+# working dir
 DEFAULT_ROOT = Path("/testbed").resolve()
 DEFAULT_ROOT.mkdir(parents=True, exist_ok=True)
 SERVER_FILE = Path(__file__).resolve().as_posix()
 
 app = Flask(__name__)
 
-# ─── Stateful shell process ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Stateful shell for legacy commands
+# ─────────────────────────────────────────────────────────────────────────────
 def _start_shell() -> subprocess.Popen[str]:
     return subprocess.Popen(
         ["/bin/bash"],
@@ -50,13 +57,13 @@ def _start_shell() -> subprocess.Popen[str]:
 SHELL_PROC = _start_shell()
 SHELL_LOCK = threading.Lock()
 
-def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int]:
+def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str,str,int]:
     global SHELL_PROC
     with SHELL_LOCK:
         if SHELL_PROC.poll() is not None:
             SHELL_PROC = _start_shell()
+
         marker = uuid.uuid4().hex
-        # send command
         SHELL_PROC.stdin.write(f"cd {cwd}\n{cmd}\necho {marker}$?\n")
         SHELL_PROC.stdin.flush()
 
@@ -64,7 +71,7 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
         rc = -1
         start = time.time()
         while True:
-            if timeout and time.time() - start > timeout:
+            if timeout and time.time()-start > timeout:
                 return "", "Timed out", -9
             line = SHELL_PROC.stdout.readline()
             if not line:
@@ -74,9 +81,11 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
                 rc = int(line[len(marker):].strip())
                 break
             out_lines.append(line)
-        return "".join(out_lines), "" if rc == 0 else f"exit {rc}", rc
+        return "".join(out_lines), "" if rc==0 else f"exit {rc}", rc
 
-# ─── Stateful IPython REPL ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) IPython‑based REPL
+# ─────────────────────────────────────────────────────────────────────────────
 _REPL_PATH = Path(tempfile.gettempdir()) / "ipython_repl.py"
 _REPL_PATH.write_text(textwrap.dedent("""
 import sys, json, io, traceback, os
@@ -84,11 +93,15 @@ from contextlib import redirect_stdout, redirect_stderr
 from IPython.core.interactiveshell import InteractiveShell
 
 shell = InteractiveShell.instance()
+# prevent prompts/banners
+shell.separate_in = ''
+shell.separate_out = ''
+shell.separate_out2 = ''
 
 for raw in sys.stdin:
     try:
         msg = json.loads(raw)
-        code = msg.get('code', '')
+        code = msg.get('code','')
         cwd = msg.get('cwd')
         if cwd:
             os.chdir(cwd)
@@ -98,79 +111,86 @@ for raw in sys.stdin:
         out, err = outbuf.getvalue(), errbuf.getvalue()
     except Exception:
         out, err = '', traceback.format_exc()
-    sys.stdout.write(json.dumps({'out': out, 'err': err}) + '\\n')
+    sys.stdout.write(json.dumps({'out':out,'err':err}) + '\\n')
     sys.stdout.flush()
 """))
 
 def _start_repl() -> subprocess.Popen[str]:
     return subprocess.Popen(
-        [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
+        [str(SANDBOX_PREFIX/"bin/python"), "-u", str(_REPL_PATH)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd=DEFAULT_ROOT, env=_SANDBOX_ENV, text=True, bufsize=1
     )
 
-_PY_LOCK = threading.Lock()
 PY_REPL = _start_repl()
+_PY_LOCK = threading.Lock()
 
-def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
+def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str,str]:
     os.chdir(cwd)
     try:
-        res = apply_patch.process_patch(
+        out = apply_patch.process_patch(
             block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file
         )
-        return res + "\n", ""
+        return out+"\n",""
     except Exception:
-        tb = traceback.format_exc()
-        # clean out our server frames
-        tb = "\n".join(ln for ln in tb.splitlines() if SERVER_FILE not in ln)
-        return "", tb
+        tb = traceback.format_exc().splitlines()
+        clean = [ln for ln in tb if SERVER_FILE not in ln]
+        return "","".join(clean)
 
-def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
+def _dispatch(cell: str, cwd: Path) -> Tuple[str,str]:
     cell = textwrap.dedent(cell)
-    # special: handle %%bash + apply_patch
+    # special-case apply_patch
     if cell.lstrip().startswith("%%bash") and "apply_patch" in cell:
-        # extract patch block
         lines = cell.splitlines()
-        patch_lines, capture = [], False
+        patch, cap = [], False
         for ln in lines:
             if '<<"EOF"' in ln or ln.strip().endswith("<<EOF"):
-                capture = True
-                continue
-            if capture and ln.strip() == "EOF":
+                cap = True; continue
+            if cap and ln.strip()=="EOF":
                 break
-            if capture:
-                patch_lines.append(ln)
-        return _exec_apply_patch("\n".join(patch_lines), cwd)
+            if cap:
+                patch.append(ln)
+        return _exec_apply_patch("\n".join(patch), cwd)
 
     # otherwise send to IPython REPL
-    msg = json.dumps({"code": cell, "cwd": str(cwd)})
+    msg = json.dumps({"code":cell, "cwd":str(cwd)})
     with _PY_LOCK:
-        global PY_REPL
         if PY_REPL.poll() is not None:
+            # restart if crashed
+            global PY_REPL
             PY_REPL = _start_repl()
-        PY_REPL.stdin.write(msg + "\n")
+        PY_REPL.stdin.write(msg+"\n")
         PY_REPL.stdin.flush()
-        resp = PY_REPL.stdout.readline()
-    data = json.loads(resp)
-    return data["out"], data["err"]
 
-def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
-    res: Dict[int, Any] = {}
-    err: Dict[int, Any] = {}
+        # consume until we get a valid JSON line
+        while True:
+            resp = PY_REPL.stdout.readline()
+            if not resp:
+                # REPL died—restart and error out
+                PY_REPL = _start_repl()
+                return "","REPL crashed"
+            try:
+                data = json.loads(resp)
+                return data["out"], data["err"]
+            except json.JSONDecodeError:
+                # skip any banner or blank lines
+                continue
 
+def _run_with_timeout(fn, timeout:int, *args) -> Tuple[str,str,bool]:
+    res: Dict[int,str] = {}
+    err: Dict[int,str] = {}
     def target():
         try:
-            o, e = fn(*args)
-            res[0], err[0] = o, e
+            o,e = fn(*args)
+            res[0], err[0] = o,e
         except Exception:
             err[0] = traceback.format_exc()
-
     th = threading.Thread(target=target, daemon=True)
     th.start()
     th.join(timeout)
     if th.is_alive():
-        return "", "Timed out", True
-    return res.get(0, ""), err.get(0, ""), False
+        return "","Timed out",True
+    return res.get(0,""), err.get(0,""), False
 
 # ─── Git‑patch & evaluation helpers (unchanged) ───────────────────────────────
 def _remove_binary_diffs(patch_text: str) -> str:
