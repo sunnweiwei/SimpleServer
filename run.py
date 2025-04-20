@@ -220,7 +220,11 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
     if 'APPLY_PATCH_FAIL' in apply_out:
         report['failed_apply_patch'] = True
         return report
+
     eval_out, eval_err, rc = _exec_shell('/tmp/eval.sh', cwd, timeout=timeout)
+    print(eval_out)
+    print('=' * 30)
+    print(eval_err)
     report['eval_output'] = eval_out + eval_err
     if rc == -9:
         report['test_timeout'] = True
@@ -257,7 +261,7 @@ def execute_endpoint():
         except json.JSONDecodeError as exc:
             results.append({'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
             continue
-        code = args.get('input');
+        code = args.get('input')
         if code is None:
             results.append({'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': "'input' missing", 'timed_out': False, 'duration': 0.0}); continue
         o_start = time.time()
@@ -316,6 +320,42 @@ def command_endpoint():
         'duration': round(time.time() - start, 3)
     })
 
+
+@app.route('/upload_file', methods=['POST'])
+def upload_file_endpoint():
+    """Upload a file (or zip archive) to the server.
+
+    Query params:
+      destination – absolute/relative path where the file/dir should land
+      recursive   – 'true' if the upload is a zip of a directory to be extracted
+    """
+    dest = request.args.get('destination')
+    if not dest:
+        return jsonify({'error': 'destination param missing'}), 400
+    recursive = request.args.get('recursive', 'false').lower() == 'true'
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'file field missing'}), 400
+    file_storage = request.files['file']
+
+    try:
+        target_path = (Path(dest) if Path(dest).is_absolute() else DEFAULT_ROOT / dest).resolve()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if recursive:
+            # Expect a zip file – extract
+            with tempfile.TemporaryDirectory() as tmpdir:
+                archive_path = Path(tmpdir) / 'upload.zip'
+                file_storage.save(archive_path)
+                import zipfile
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    zf.extractall(target_path)
+        else:
+            file_storage.save(target_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'status': 'ok', 'path': str(target_path), 'recursive': recursive})
+
 ###############################################################################
 # Entrypoint
 ###############################################################################
@@ -323,4 +363,3 @@ def command_endpoint():
 if __name__ == '__main__':
     port = 4444
     app.run(host='0.0.0.0', port=port, threaded=True)
-
