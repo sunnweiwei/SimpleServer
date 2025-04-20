@@ -168,14 +168,14 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
         patch_lines: List[str] = []
         cap = False
         for ln in remainder.splitlines():
-            if '<<"EOF"' in ln or ln.strip().endswith("<<EOF"):
+            if '<<' in ln and 'EOF' in ln:
                 cap = True
                 continue
             if cap and ln.strip() == "EOF":
                 break
             if cap:
                 patch_lines.append(ln)
-        return _exec_apply_patch("\n".join(patch_lines), cwd)
+        return _exec_apply_patch("\n".join(patch_lines).strip(), cwd)
 
     # Otherwise, send raw cell to IPython REPL
     msg = json.dumps({"code": cell, "cwd": str(cwd)})
