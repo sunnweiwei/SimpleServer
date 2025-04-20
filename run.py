@@ -70,104 +70,90 @@ SHELL_PROC = _start_shell()
 SHELL_LOCK = threading.Lock()
 
 
+# Add these imports at the top of the file with the other imports
+from jupyter_client import KernelManager
+from queue import Empty
+
+
+# Add this after the REPL initialization section
 # ─────────────────────────────────────────────────────────────────────────────
-#  Lightweight internal Python REPL (kept for helpers)
+# Stateful Jupyter Notebook kernel
 # ─────────────────────────────────────────────────────────────────────────────
-
-_REPL_PATH = Path(tempfile.gettempdir()) / "python_repl.py"
-_REPL_PATH.write_text(textwrap.dedent("""
-import sys, json, io, traceback
-from code import InteractiveConsole
-from contextlib import redirect_stdout, redirect_stderr
-console = InteractiveConsole(globals())
-for raw in sys.stdin:
-    try:
-        msg = json.loads(raw)
-        src = msg.get('code', '')
-        outbuf, errbuf = io.StringIO(), io.StringIO()
-        with redirect_stdout(outbuf), redirect_stderr(errbuf):
-            console.runsource(src)
-    except Exception:
-        errbuf.write(traceback.format_exc())
-    sys.stdout.write(json.dumps({'out': outbuf.getvalue(), 'err': errbuf.getvalue()}) + '\\n')
-    sys.stdout.flush()
-"""))
-
-def _start_repl() -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=DEFAULT_ROOT,
-        env=_SANDBOX_ENV,
-        text=True,
-        bufsize=1,
-    )
-
-_PY_LOCK = threading.Lock()
-PY_REPL = _start_repl()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Jupyter kernel (new, stateful, full notebook semantics)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _start_kernel():
-    python_exe = SANDBOX_PREFIX / "bin" / "python"       # /opt/…/testbed/bin/python
-    km = KernelManager(
-        kernel_name="",                                  # leave empty
-        kernel_cmd=[str(python_exe),
-                    "-m", "ipykernel_launcher", "-f", "{connection_file}"],
-    )
-    km.start_kernel(cwd=str(DEFAULT_ROOT), env=_SANDBOX_ENV)
+def _init_jupyter_kernel():
+    # Create kernel manager for python3
+    km = KernelManager()
+    # Start the kernel with the sandbox environment
+    km.start_kernel(env=_SANDBOX_ENV)
+    # Get the client
     kc = km.client()
-    kc.start_channels()
+    # Wait for kernel to be ready
     kc.wait_for_ready()
     return km, kc
 
-_KM, _KC = _start_kernel()
-_KERNEL_LOCK = threading.Lock()
 
-def _exec_notebook(code: str, cwd: Path) -> Tuple[str, str]:
-    """
-    Execute *code* in the persistent Jupyter kernel and capture stdout / stderr.
-    """
-    global _KM, _KC
-    stdout_chunks, stderr_chunks = [], []
+# Global kernel manager and client
+JUPYTER_KM, JUPYTER_KC = None, None
+JUPYTER_LOCK = threading.Lock()
 
-    with _KERNEL_LOCK:
-        # Revive the kernel if it has died.
-        if _KC is None or not _KC.is_alive():
+
+# Execute a cell with the Jupyter kernel
+def _exec_jupyter(cell: str, cwd: Path) -> tuple[str, str]:
+    global JUPYTER_KM, JUPYTER_KC
+
+    with JUPYTER_LOCK:
+        # Initialize kernel if needed
+        if JUPYTER_KM is None or not JUPYTER_KM.is_alive():
+            JUPYTER_KM, JUPYTER_KC = _init_jupyter_kernel()
+
+        try:
+            # Change to the correct working directory
+            JUPYTER_KC.execute(f"import os; os.chdir('{cwd}')")
+
+            # Execute the cell
+            msg_id = JUPYTER_KC.execute(cell)
+
+            # Collect outputs
+            stdout, stderr = '', ''
+
+            # Process messages until the execution is complete
+            done = False
+            while not done:
+                try:
+                    msg = JUPYTER_KC.get_iopub_msg(timeout=60)
+
+                    # Only process messages for our execution
+                    parent_id = msg.get('parent_header', {}).get('msg_id')
+                    if parent_id != msg_id:
+                        continue
+
+                    msg_type = msg['header']['msg_type']
+                    content = msg['content']
+
+                    if msg_type == 'stream':
+                        if content['name'] == 'stdout':
+                            stdout += content['text']
+                        elif content['name'] == 'stderr':
+                            stderr += content['text']
+                    elif msg_type == 'error':
+                        stderr += f"\n{content['ename']}: {content['evalue']}\n"
+                        stderr += '\n'.join(content['traceback'])
+                    elif msg_type == 'status' and content['execution_state'] == 'idle':
+                        done = True
+                except Empty:
+                    stderr += "\nExecution timed out\n"
+                    done = True
+
+            return stdout, stderr
+
+        except Exception as e:
+            # Handle any errors, including restarting the kernel if needed
+            stderr = f"Jupyter execution error: {str(e)}\n{traceback.format_exc()}"
             try:
-                _KM.shutdown_kernel(now=True, restart=False)
-            except Exception:
+                # Attempt to restart the kernel
+                JUPYTER_KM, JUPYTER_KC = _init_jupyter_kernel()
+            except:
                 pass
-            _KM, _KC = _start_kernel()
-
-        # Ensure correct working directory inside the kernel.
-        exec_id = _KC.execute(f"%cd {cwd}\n{code}", allow_stdin=False)
-
-        # Drain the IOPub channel.
-        while True:
-            msg = _KC.get_iopub_msg(timeout=60)
-            if msg["parent_header"].get("msg_id") != exec_id:
-                continue
-
-            mtype, content = msg["msg_type"], msg["content"]
-
-            if mtype == "stream":  # regular prints
-                target = stdout_chunks if content["name"] == "stdout" else stderr_chunks
-                target.append(content["text"])
-            elif mtype in ("execute_result", "display_data"):
-                txt = content.get("data", {}).get("text/plain")
-                if txt:
-                    stdout_chunks.append(f"{txt}\n")
-            elif mtype == "error":
-                stderr_chunks.append("\n".join(content["traceback"]) + "\n")
-            elif mtype == "status" and content["execution_state"] == "idle":
-                break
-
-    return "".join(stdout_chunks), "".join(stderr_chunks)
+            return '', stderr
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -229,27 +215,6 @@ def _exec_shell(cmd: str, cwd: Path) -> tuple[str, str]:
         return "".join(out_lines), "" if rc == 0 else f"exit {rc}"
 
 
-def _exec_python(src: str, cwd: Path) -> tuple[str, str]:
-    """Private helper (still used internally)."""
-    global PY_REPL
-
-    def _send(code: str) -> tuple[str, str]:
-        msg = json.dumps({'code': code})
-        PY_REPL.stdin.write(msg + "\n")
-        PY_REPL.stdin.flush()
-        resp = PY_REPL.stdout.readline()
-        data = json.loads(resp)
-        return data['out'], data['err']
-
-    with _PY_LOCK:
-        if PY_REPL.poll() is not None:
-            PY_REPL = _start_repl()
-        try:
-            return _send(src)
-        except (BrokenPipeError, OSError):
-            PY_REPL = _start_repl()
-            return _send(src)
-
 
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     os.chdir(cwd)
@@ -266,29 +231,24 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
 #  Cell dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Replace the existing _dispatch function with this one
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
-    """
-    • If the cell is a `%%bash … apply_patch …` block → run through
-      `_exec_apply_patch` (unchanged behaviour).
-    • Otherwise forward the entire cell verbatim to the notebook kernel.
-    """
     cell = textwrap.dedent(cell)
-
-    # Special‑case: git patch application
+    # Keep the special case for apply_patch
     if cell.lstrip().startswith('%%bash') and 'apply_patch' in cell:
-        lines, capturing, patch_lines = cell.splitlines(), False, []
+        lines, cap, patch = cell.splitlines(), False, []
         for ln in lines:
             if '<<"EOF"' in ln or ln.strip().endswith('<<EOF'):
-                capturing = True
+                cap = True
                 continue
-            if ln.strip() == 'EOF' and capturing:
+            if ln.strip() == 'EOF' and cap:
                 break
-            if capturing:
-                patch_lines.append(ln)
-        return _exec_apply_patch("\n".join(patch_lines), cwd)
+            if cap:
+                patch.append(ln)
+        return _exec_apply_patch("\n".join(patch), cwd)
 
-    # General execution: delegate to Jupyter kernel
-    return _exec_notebook(cell, cwd)
+    # For everything else, use Jupyter
+    return _exec_jupyter(cell, cwd)
 
 ###############################################################################
 # Git‑patch helpers (unchanged)
