@@ -51,6 +51,7 @@ _EXEC_GLOBALS: Dict[str, Any] = {
     "__file__": "<agent>",
 }
 
+
 ###############################################################################
 # Utility – error‑trace cleaner
 ###############################################################################
@@ -58,8 +59,9 @@ _EXEC_GLOBALS: Dict[str, Any] = {
 def _clean_trace(tb: str) -> str:
     return "\n".join(
         ln for ln in tb.splitlines()
-        if SERVER_FILE not in ln and "/flask/" not in ln and "/runpy.py" not in ln
+        if SERVER_FILE not in ln and "/flask/" not in ln
     )
+
 
 ###############################################################################
 # Low‑level executors
@@ -76,15 +78,25 @@ def _exec_python(src: str, cwd: Path) -> Tuple[str, str]:
     return stdout.getvalue(), stderr.getvalue()
 
 
-def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None) -> Tuple[str, str, int]:
-    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _exec_shell(cmd: str, cwd: Path, timeout: int | None = None, *, merge: bool = False) -> Tuple[str, str, int]:
+    """Execute *cmd* in *cwd*.
+
+    If *merge* is True, stdout and stderr are combined in order and returned as
+    `stdout` (stderr string will be empty). Otherwise they are captured
+    separately and order may differ.
+    """
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         return "", "Timed out", -9
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not merge:
         err = _clean_trace(err or f"Command exited with {proc.returncode}")
+    if merge:
+        # all output in *out*, keep err empty
+        return out, "", proc.returncode
     return out, err, proc.returncode
 
 
@@ -96,24 +108,28 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     except Exception:
         return "", _clean_trace(traceback.format_exc())
 
+
 ###############################################################################
 # Timeout wrapper for dispatch cells
 ###############################################################################
 
 def _run_with_timeout(fn, timeout: int, *args, **kwargs) -> Tuple[str, str, bool]:
     result, err = {}, {}
+
     def _target():
         try:
             o, e = fn(*args, **kwargs)
             result[0], err[0] = o, e
         except Exception:
             err[0] = _clean_trace(traceback.format_exc())
+
     th = threading.Thread(target=_target, daemon=True)
     th.start()
     th.join(timeout)
     if th.is_alive():
         return "", "Timed out", True
     return result.get(0, ""), err.get(0, ""), False
+
 
 ###############################################################################
 # Mixed‑cell dispatcher
@@ -157,6 +173,7 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     flush_py()
     return "".join(outs), "".join(errs)
 
+
 ###############################################################################
 # Git‑patch helpers (unchanged)
 ###############################################################################
@@ -184,8 +201,10 @@ def get_git_patch(base_commit: str, workdir: Path = DEFAULT_ROOT) -> str:
     subprocess.run('git add -A', shell=True, cwd=cwd)
     remove_bin_cmd = r'''for f in $(git status --porcelain | grep -E "^(M| M|\?\?|A| A)" | cut -c4-); do if [ -f "$f" ] && (file -b "$f" | grep -q "executable" || git check-attr binary "$f" | grep -q "binary: set"); then git rm -f "$f" 2>/dev/null || rm -f "$f"; fi; done'''
     subprocess.run(remove_bin_cmd, shell=True, cwd=cwd)
-    diff = subprocess.run(f'git diff --no-color --cached {base_commit}', shell=True, cwd=cwd, text=True, stdout=subprocess.PIPE)
+    diff = subprocess.run(f'git diff --no-color --cached {base_commit}', shell=True, cwd=cwd, text=True,
+                          stdout=subprocess.PIPE)
     return _remove_binary_diffs(diff.stdout)
+
 
 ###############################################################################
 # Patch‑evaluation helper (unchanged)
@@ -204,8 +223,11 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
     if not model_patch.strip():
         report['empty_generation'] = True
         return report
-    patch_path = Path('/tmp/patch.diff'); patch_path.write_text(model_patch)
-    script_path = Path('/tmp/eval.sh'); script_path.write_text(eval_script); script_path.chmod(0o755)
+    patch_path = Path('/tmp/patch.diff');
+    patch_path.write_text(model_patch)
+    script_path = Path('/tmp/eval.sh');
+    script_path.write_text(eval_script);
+    script_path.chmod(0o755)
     cwd = workdir.resolve()
     # apply_cmd = "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || (patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS') || echo 'APPLY_PATCH_FAIL'"
     apply_cmd = (
@@ -216,12 +238,14 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
         "echo 'APPLY_PATCH_FAIL')))"
     )
     out, err, _ = _exec_shell(apply_cmd, cwd)
-    apply_out = (out + err).strip(); report['apply_output'] = apply_out
+    apply_out = (out + err).strip();
+    report['apply_output'] = apply_out
     if 'APPLY_PATCH_FAIL' in apply_out:
         report['failed_apply_patch'] = True
         return report
 
-    eval_out, eval_err, rc = _exec_shell('/tmp/eval.sh', cwd, timeout=timeout)
+    eval_out, eval_err, rc = _exec_shell('/tmp/eval.sh', cwd, timeout=timeout, merge=True)
+    report['eval_output'] = eval_out + eval_err
     print(eval_out)
     print('=' * 30)
     print(eval_err)
@@ -234,6 +258,7 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
         return report
     report['resolved'] = 'RESOLVED' in report['eval_output'].upper()
     return report
+
 
 ###############################################################################
 # Flask routes
@@ -259,14 +284,20 @@ def execute_endpoint():
         try:
             args = json.loads(msg.get('arguments', '{}'))
         except json.JSONDecodeError as exc:
-            results.append({'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
+            results.append(
+                {'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': str(exc), 'timed_out': False,
+                 'duration': 0.0})
             continue
         code = args.get('input')
         if code is None:
-            results.append({'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': "'input' missing", 'timed_out': False, 'duration': 0.0}); continue
+            results.append(
+                {'index': idx, 'call_id': msg['call_id'], 'output': '', 'error': "'input' missing", 'timed_out': False,
+                 'duration': 0.0});
+            continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
-        results.append({'index': idx, 'call_id': msg['call_id'], 'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
+        results.append({'index': idx, 'call_id': msg['call_id'], 'output': out, 'error': err, 'timed_out': timed,
+                        'duration': round(time.time() - o_start, 3)})
     if not results:
         return jsonify({'error': 'No python function_call messages found'}), 400
     return jsonify({'results': results, 'overall_duration': round(time.time() - start, 3)})
@@ -276,7 +307,8 @@ def execute_endpoint():
 def diff_endpoint():
     if not request.is_json:
         return jsonify({'error': 'Request must be JSON'}), 400
-    data = request.get_json(); base_commit = data.get('base_commit')
+    data = request.get_json();
+    base_commit = data.get('base_commit')
     if not base_commit:
         return jsonify({'error': 'base_commit missing'}), 400
     workdir = Path(data.get('dir', DEFAULT_ROOT)).resolve()
@@ -355,6 +387,7 @@ def upload_file_endpoint():
     except Exception as exc:  # pylint: disable=broad-except
         return jsonify({'error': str(exc)}), 500
     return jsonify({'status': 'ok', 'path': str(target_path), 'recursive': recursive})
+
 
 ###############################################################################
 # Entrypoint
