@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-A self‑contained **pure‑Python 3.9+** utility for applying human‑readable
+A self‑contained **pure‑Python 3.9+** utility for applying human‑readable
 “pseudo‑diff” patch files to a collection of text files.
-
-This version adds **robust context matching**:
-  • canonical normalisation (tabs→spaces, collapse whitespace, drop back‑slashes)  
-  • multi‑stage fallback: raw exact → canonical exact → canonical stripped → fuzzy  
-  • richer DiffError messages that surface the closest candidate line
 """
 
 from __future__ import annotations
