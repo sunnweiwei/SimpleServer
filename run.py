@@ -107,25 +107,35 @@ import sys, json, io, traceback, os
 from contextlib import redirect_stdout, redirect_stderr
 from IPython.core.interactiveshell import InteractiveShell
 
+# 1) Always search /testbed before anything else
+sys.path.insert(0, "/testbed")
+
 shell = InteractiveShell.instance()
 shell.separate_in = ''
 shell.separate_out = ''
 shell.separate_out2 = ''
 
+# 2) Auto‑reload every module before executing each cell
+shell.run_cell("%load_ext autoreload")
+shell.run_cell("%autoreload 2")
+
 for raw in sys.stdin:
     try:
         msg = json.loads(raw)
-        code = msg.get('code','')
+        code = msg.get('code', '')
         cwd = msg.get('cwd')
         if cwd:
             os.chdir(cwd)
+            # ensure /testbed remains first on sys.path
+            if sys.path[0] != "/testbed":
+                sys.path.insert(0, "/testbed")
         outbuf, errbuf = io.StringIO(), io.StringIO()
         with redirect_stdout(outbuf), redirect_stderr(errbuf):
             shell.run_cell(code)
         out, err = outbuf.getvalue(), errbuf.getvalue()
     except Exception:
         out, err = '', traceback.format_exc()
-    sys.stdout.write(json.dumps({'out':out,'err':err}) + '\\n')
+    sys.stdout.write(json.dumps({'out': out, 'err': err}) + '\n')
     sys.stdout.flush()
 """))
 
@@ -335,18 +345,18 @@ def execute_endpoint():
         try:
             args = json.loads(msg.get('arguments', '{}'))
         except json.JSONDecodeError as exc:
-            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': msg, 
+            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': msg,
                             'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
             continue
         code = args.get('input')
         if code is None:
-            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code, 
+            results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code,
                             'output': '', 'error': "'input' missing", 'timed_out': False, 'duration': 0.0})
             continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
         print(err)
-        results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code, 
+        results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code,
                         'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
     if not results:
         return jsonify({'error': 'No python function_call messages found'}), 400
