@@ -135,7 +135,7 @@ for raw in sys.stdin:
         out, err = outbuf.getvalue(), errbuf.getvalue()
     except Exception:
         out, err = '', traceback.format_exc()
-    sys.stdout.write(json.dumps({'out': out, 'err': err}) + '\n')
+    sys.stdout.write(json.dumps({'out': out, 'err': err}) + '\\n')
     sys.stdout.flush()
 """))
 
