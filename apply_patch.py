@@ -253,11 +253,15 @@ class Parser:
     def _parse_add_file(self) -> PatchAction:
         lines: List[str] = []
         while not self.is_done(
-            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
+                ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
         ):
             s = self.read_line()
             if not s.startswith("+"):
-                raise DiffError(f"Invalid Add File line (missing '+'): {s}")
+                # provide a hint about the missing '+' prefix
+                raise DiffError(
+                    f"Invalid Add File line (missing '+'): {s!r}\n"
+                    f"Hint: each added line must start with '+'. Did you forget the '+' on this line?"
+                )
             lines.append(s[1:])  # strip leading '+'
         return PatchAction(type=ActionType.ADD, new_file="\n".join(lines))
 
