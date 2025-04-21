@@ -172,6 +172,12 @@ def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
         i += 1
     remainder = "\n".join(lines[i:])
 
+    if remainder.lstrip().startswith("%%bash") and "apply_patch" not in cell:
+        bash_lines = remainder.splitlines()[1:] # drop the '%%bash' line
+        bash_script = "\n".join(bash_lines)
+        out, err, rc = _exec_shell(bash_script, cwd)
+        return out, ""
+
     # Special: %%bash + apply_patch after comments
     if remainder.lstrip().startswith("%%bash") and "apply_patch" in cell:
         patch_lines: List[str] = []
