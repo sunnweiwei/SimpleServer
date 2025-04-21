@@ -187,45 +187,57 @@ class Parser:
         lines = text.split("\n")
         index = 0
         while not self.is_done(
-            (
-                "*** End Patch",
-                "*** Update File:",
-                "*** Delete File:",
-                "*** Add File:",
-                "*** End of File",
-            )
+                (
+                        "*** End Patch",
+                        "*** Update File:",
+                        "*** Delete File:",
+                        "*** Add File:",
+                        "*** End of File",
+                )
         ):
-            def_str = self.read_str("@@ ")
-            section_str = ""
-            if not def_str and self._norm(self._cur_line()) == "@@":
-                section_str = self.read_line()
+            # Collect all consecutive context markers
+            context_markers = []
+            while not self.is_done() and self.startswith("@@"):
+                context_line = self.read_str("@@ ")
+                if context_line.strip():
+                    context_markers.append(context_line)
+                elif self._norm(self._cur_line()) == "@@":
+                    section_str = self.read_line()
+                    if section_str[2:].strip():  # Skip "@@" prefix
+                        context_markers.append(section_str[2:].strip())
 
-            if not (def_str or section_str or index == 0):
+            if not context_markers and index == 0:
+                # No context markers at the start is valid
+                pass
+            elif not context_markers:
                 raise DiffError(f"Invalid line in update section:\n{self._cur_line()}")
 
-            if def_str.strip():
+            # Apply all context markers to find the right location
+            for marker in context_markers:
                 found = False
-                if def_str not in lines[:index]:
+                if marker not in lines[index:]:
                     for i, s in enumerate(lines[index:], index):
-                        if s == def_str:
+                        if s == marker or s.strip() == marker.strip():
                             index = i + 1
                             found = True
                             break
-                if not found and def_str.strip() not in [
-                    s.strip() for s in lines[:index]
-                ]:
+                if not found:
+                    # Try fuzzy matching
                     for i, s in enumerate(lines[index:], index):
-                        if s.strip() == def_str.strip():
+                        if canonical(s) == canonical(marker):
                             index = i + 1
                             self.fuzz += 1
                             found = True
                             break
+                if not found:
+                    raise DiffError(f"Context marker not found: {marker}")
 
+            # Now process the changes as before
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
             new_index, fuzz = find_context(lines, next_ctx, index, eof)
 
             if new_index == -1:
-                # -------- enhanced error report ---------------------------------- #
+                # Error reporting code remains unchanged
                 best_ratio, best_i = 0.0, -1
                 target = canonical(next_ctx[0]) if next_ctx else ""
                 for i, line in enumerate(lines):
@@ -237,10 +249,9 @@ class Parser:
                 raise DiffError(
                     f"Context-match failed at patch offset {self.index}.\n"
                     f"Expected context (first 3 lines):\n>>> {ctx_txt}\n"
-                    f"Closest match in file at line {best_i+1 if best_i!=-1 else 'N/A'} "
+                    f"Closest match in file at line {best_i + 1 if best_i != -1 else 'N/A'} "
                     f"(similarity {best_ratio:.2f}):\n>>> {cand_line!r}"
                 )
-            # -------------------------------------------------------------------- #
 
             self.fuzz += fuzz
             for ch in chunks:
