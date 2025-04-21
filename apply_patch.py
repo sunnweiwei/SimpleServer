@@ -253,15 +253,11 @@ class Parser:
     def _parse_add_file(self) -> PatchAction:
         lines: List[str] = []
         while not self.is_done(
-                ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
+            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
         ):
             s = self.read_line()
             if not s.startswith("+"):
-                # provide a hint about the missing '+' prefix
-                raise DiffError(
-                    f"Invalid Add File line (missing '+'): {s!r}\n"
-                    f"Hint: each added line must start with '+'. Did you forget the '+' on this line?"
-                )
+                raise DiffError(f"Invalid Add File line (missing '+'): {s}")
             lines.append(s[1:])  # strip leading '+'
         return PatchAction(type=ActionType.ADD, new_file="\n".join(lines))
 
@@ -358,7 +354,11 @@ def peek_next_section(
         elif s[0] == " ":
             mode = "keep"
         else:
-            raise DiffError(f"Invalid Line: {s}")
+            raise DiffError(
+                f"Invalid patch line (missing prefix): {s!r}\n"
+                f"Hint: each line in a patch section must start with ' ', '+', or '-'. "
+                f"Did you forget to prefix this line with '+' (for additions) or '-' (for deletions)?"
+            )
         s = s[1:]
 
         if mode == "keep" and last_mode != mode:
