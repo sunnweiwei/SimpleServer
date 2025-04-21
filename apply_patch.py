@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-
 """
-A self-contained **pure-Python 3.9+** utility for applying human-readable
-“pseudo-diff” patch files to a collection of text files.
+A self‑contained **pure‑Python 3.9+** utility for applying human‑readable
+“pseudo‑diff” patch files to a collection of text files.
+
+This version adds **robust context matching**:
+  • canonical normalisation (tabs→spaces, collapse whitespace, drop back‑slashes)  
+  • multi‑stage fallback: raw exact → canonical exact → canonical stripped → fuzzy  
+  • richer DiffError messages that surface the closest candidate line
 """
 
 from __future__ import annotations
@@ -20,6 +24,23 @@ from typing import (
     Tuple,
     Union,
 )
+
+
+# --------------------------------------------------------------------------- #
+#  Normalisation helpers
+# --------------------------------------------------------------------------- #
+def canonical(s: str) -> str:
+    """
+    Convert *s* to a canonical form for tolerant comparisons:
+      • convert CRLF → LF
+      • convert TABs to single spaces
+      • remove backslashes (escape chars)
+      • collapse all whitespace runs to single spaces
+      • strip leading/trailing whitespace
+    """
+    s = s.replace("\r", "").replace("\t", " ").replace("\\", "")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -49,24 +70,6 @@ class Commit:
 # --------------------------------------------------------------------------- #
 class DiffError(ValueError):
     """Any problem detected while parsing or applying a patch."""
-
-
-# --------------------------------------------------------------------------- #
-#  Normalization & helper for fuzzy errors
-# --------------------------------------------------------------------------- #
-def canonical(s: str) -> str:
-    """
-    Create a normalized form of the line for matching:
-    - strip CR
-    - convert tabs to spaces
-    - remove escaping backslashes
-    - collapse whitespace to single spaces
-    - strip ends
-    """
-    text = s.replace("\r", "").replace("\t", " ")
-    text = text.replace("\\", "")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +106,7 @@ class Parser:
     patch: Patch = field(default_factory=Patch)
     fuzz: int = 0
 
+    # ------------- low-level helpers -------------------------------------- #
     def _cur_line(self) -> str:
         if self.index >= len(self.lines):
             raise DiffError("Unexpected end of input while parsing patch")
@@ -110,12 +114,18 @@ class Parser:
 
     @staticmethod
     def _norm(line: str) -> str:
+        """Strip CR so comparisons work for both LF and CRLF input."""
         return line.rstrip("\r")
 
+    # ------------- scanning convenience ----------------------------------- #
     def is_done(self, prefixes: Optional[Tuple[str, ...]] = None) -> bool:
         if self.index >= len(self.lines):
             return True
-        if prefixes and self._norm(self._cur_line()).startswith(prefixes):
+        if (
+            prefixes
+            and len(prefixes) > 0
+            and self._norm(self._cur_line()).startswith(prefixes)
+        ):
             return True
         return False
 
@@ -123,35 +133,42 @@ class Parser:
         return self._norm(self._cur_line()).startswith(prefix)
 
     def read_str(self, prefix: str) -> str:
+        """
+        Consume the current line if it starts with *prefix* and return the text
+        **after** the prefix.  Raises if prefix is empty.
+        """
         if prefix == "":
             raise ValueError("read_str() requires a non-empty prefix")
         if self._norm(self._cur_line()).startswith(prefix):
-            text = self._cur_line()[len(prefix):]
+            text = self._cur_line()[len(prefix) :]
             self.index += 1
             return text
         return ""
 
     def read_line(self) -> str:
+        """Return the current raw line and advance."""
         line = self._cur_line()
         self.index += 1
         return line
 
+    # ------------- public entry point -------------------------------------- #
     def parse(self) -> None:
         while not self.is_done(("*** End Patch",)):
-            # Update
+            # ---------- UPDATE ---------- #
             path = self.read_str("*** Update File: ")
             if path:
                 if path in self.patch.actions:
                     raise DiffError(f"Duplicate update for file: {path}")
-                move_to = self.read_str("*** Move to: ") or None
+                move_to = self.read_str("*** Move to: ")
                 if path not in self.current_files:
                     raise DiffError(f"Update File Error - missing file: {path}")
-                action = self._parse_update_file(self.current_files[path])
-                action.move_path = move_to
+                text = self.current_files[path]
+                action = self._parse_update_file(text)
+                action.move_path = move_to or None
                 self.patch.actions[path] = action
                 continue
 
-            # Delete
+            # ---------- DELETE ---------- #
             path = self.read_str("*** Delete File: ")
             if path:
                 if path in self.patch.actions:
@@ -161,7 +178,7 @@ class Parser:
                 self.patch.actions[path] = PatchAction(type=ActionType.DELETE)
                 continue
 
-            # Add
+            # ---------- ADD ---------- #
             path = self.read_str("*** Add File: ")
             if path:
                 if path in self.patch.actions:
@@ -175,109 +192,127 @@ class Parser:
 
         if not self.startswith("*** End Patch"):
             raise DiffError("Missing *** End Patch sentinel")
-        self.index += 1
+        self.index += 1  # consume sentinel
 
+    # ------------- section parsers ---------------------------------------- #
     def _parse_update_file(self, text: str) -> PatchAction:
         action = PatchAction(type=ActionType.UPDATE)
         lines = text.split("\n")
-        idx = 0
-
-        while not self.is_done((
-            "*** End Patch",
-            "*** Update File:",
-            "*** Delete File:",
-            "*** Add File:",
-            "*** End of File",
-        )):
+        index = 0
+        while not self.is_done(
+            (
+                "*** End Patch",
+                "*** Update File:",
+                "*** Delete File:",
+                "*** Add File:",
+                "*** End of File",
+            )
+        ):
             def_str = self.read_str("@@ ")
             section_str = ""
             if not def_str and self._norm(self._cur_line()) == "@@":
                 section_str = self.read_line()
 
-            if not (def_str or section_str or idx == 0):
+            if not (def_str or section_str or index == 0):
                 raise DiffError(f"Invalid line in update section:\n{self._cur_line()}")
 
+            if def_str.strip():
+                found = False
+                if def_str not in lines[:index]:
+                    for i, s in enumerate(lines[index:], index):
+                        if s == def_str:
+                            index = i + 1
+                            found = True
+                            break
+                if not found and def_str.strip() not in [
+                    s.strip() for s in lines[:index]
+                ]:
+                    for i, s in enumerate(lines[index:], index):
+                        if s.strip() == def_str.strip():
+                            index = i + 1
+                            self.fuzz += 1
+                            found = True
+                            break
+
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
-            new_idx, fuzz = find_context(self.lines_for_context(lines), next_ctx, idx, eof)
-            if new_idx == -1:
-                # rich error: show expected snippet and best fuzzy candidate
-                target = canonical(next_ctx[0])
+            new_index, fuzz = find_context(lines, next_ctx, index, eof)
+
+            if new_index == -1:
+                # -------- enhanced error report ---------------------------------- #
                 best_ratio, best_i = 0.0, -1
-                for i, ln in enumerate(lines):
-                    r = difflib.SequenceMatcher(None, canonical(ln), target).ratio()
+                target = canonical(next_ctx[0]) if next_ctx else ""
+                for i, line in enumerate(lines):
+                    r = difflib.SequenceMatcher(None, canonical(line), target).ratio()
                     if r > best_ratio:
                         best_ratio, best_i = r, i
-                snippet = "\n".join(next_ctx[:3]) + ("\n…" if len(next_ctx) > 3 else "")
-                actual = lines[best_i] if best_i >= 0 else ""
+                ctx_txt = "\n".join(next_ctx[:3])
+                cand_line = lines[best_i] if best_i != -1 else ""
                 raise DiffError(
-                    f"Context match failed at patch offset {self.index}.\n"
-                    f"Expected snippet:\n>>> {snippet}\n"
-                    f"Closest match in file at line {best_i+1} "
-                    f"(similarity {best_ratio:.2f}):\n>>> {actual!r}"
+                    f"Context-match failed at patch offset {self.index}.\n"
+                    f"Expected context (first 3 lines):\n>>> {ctx_txt}\n"
+                    f"Closest match in file at line {best_i+1 if best_i!=-1 else 'N/A'} "
+                    f"(similarity {best_ratio:.2f}):\n>>> {cand_line!r}"
                 )
+            # -------------------------------------------------------------------- #
+
             self.fuzz += fuzz
             for ch in chunks:
-                ch.orig_index += new_idx
+                ch.orig_index += new_index
                 action.chunks.append(ch)
-            idx = new_idx + len(next_ctx)
+            index = new_index + len(next_ctx)
             self.index = end_idx
-
         return action
 
     def _parse_add_file(self) -> PatchAction:
         lines: List[str] = []
-        while not self.is_done((
-            "*** End Patch",
-            "*** Update File:",
-            "*** Delete File:",
-            "*** Add File:",
-        )):
+        while not self.is_done(
+            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
+        ):
             s = self.read_line()
             if not s.startswith("+"):
                 raise DiffError(f"Invalid Add File line (missing '+'): {s}")
-            lines.append(s[1:])
+            lines.append(s[1:])  # strip leading '+'
         return PatchAction(type=ActionType.ADD, new_file="\n".join(lines))
-
-    def lines_for_context(self, lines: List[str]) -> List[str]:
-        # helper to feed canonical when needed
-        return lines
 
 
 # --------------------------------------------------------------------------- #
-#  Layered context-finders
+#  Helper functions
 # --------------------------------------------------------------------------- #
 def find_context_core(
     lines: List[str], context: List[str], start: int
 ) -> Tuple[int, int]:
-    n = len(context)
-    norm_ctx = [canonical(x) for x in context]
-    L = len(lines)
+    """Return (index, fuzz_score) or (-1, 0) if no match."""
+    if not context:
+        return start, 0
 
-    # (a) exact on raw
-    for i in range(start, L - n + 1):
-        if lines[i : i + n] == context:
+    # ---------- (a) raw exact ------------------------------------------------ #
+    for i in range(start, len(lines) - len(context) + 1):
+        if lines[i : i + len(context)] == context:
             return i, 0
 
-    # (b) exact on canonical
-    for i in range(start, L - n + 1):
-        if [canonical(x) for x in lines[i : i + n]] == norm_ctx:
-            return i, 1_000
+    # ---------- (b) canonical exact ----------------------------------------- #
+    norm_ctx = [canonical(s) for s in context]
+    for i in range(start, len(lines) - len(context) + 1):
+        if [canonical(s) for s in lines[i : i + len(context)]] == norm_ctx:
+            return i, 1_000  # small fuzz penalty
 
-    # (c) stripped match
-    for i in range(start, L - n + 1):
-        if [x.strip() for x in lines[i : i + n]] == [x.strip() for x in context]:
+    # ---------- (c) canonical stripped -------------------------------------- #
+    strip_ctx = [s.strip() for s in norm_ctx]
+    for i in range(start, len(lines) - len(context) + 1):
+        if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
             return i, 10_000
 
-    # (d) fuzzy first-line on canonical
+    # ---------- (d) fuzzy first-line ---------------------------------------- #
     target = norm_ctx[0]
-    best_i, best_r = -1, 0.0
-    for i, ln in enumerate(lines[start:], start):
-        r = difflib.SequenceMatcher(None, canonical(ln), target).ratio()
-        if r > best_r:
-            best_r, best_i = r, i
-    if best_r > 0.75:
+    best_ratio, best_i = 0.0, -1
+    for i, line in enumerate(lines[start:], start):
+        ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_i = ratio, i
+    if best_ratio >= 0.75:
         return best_i, 50_000
 
+    # ---------- give up ----------------------------------------------------- #
     return -1, 0
 
 
@@ -285,11 +320,11 @@ def find_context(
     lines: List[str], context: List[str], start: int, eof: bool
 ) -> Tuple[int, int]:
     if eof:
-        idx, fuzz = find_context_core(lines, context, len(lines) - len(context))
-        if idx != -1:
-            return idx, fuzz
-        idx, fuzz2 = find_context_core(lines, context, start)
-        return idx, fuzz2 + 10_000
+        new_index, fuzz = find_context_core(lines, context, len(lines) - len(context))
+        if new_index != -1:
+            return new_index, fuzz
+        new_index, fuzz = find_context_core(lines, context, start)
+        return new_index, fuzz + 10_000
     return find_context_core(lines, context, start)
 
 
@@ -300,55 +335,77 @@ def peek_next_section(
     del_lines: List[str] = []
     ins_lines: List[str] = []
     chunks: List[Chunk] = []
-    orig_index = index
     mode = "keep"
+    orig_index = index
 
     while index < len(lines):
         s = lines[index]
-        if s.startswith((
-            "@@",
-            "*** End Patch",
-            "*** Update File:",
-            "*** Delete File:",
-            "*** Add File:",
-            "*** End of File",
-        )) or s == "***":
+        if s.startswith(
+            (
+                "@@",
+                "*** End Patch",
+                "*** Update File:",
+                "*** Delete File:",
+                "*** Add File:",
+                "*** End of File",
+            )
+        ):
+            break
+        if s == "***":
             break
         if s.startswith("***"):
             raise DiffError(f"Invalid Line: {s}")
         index += 1
-        last = mode
+
+        last_mode = mode
         if s == "":
             s = " "
-        c0 = s[0]
-        if c0 == "+": mode = "add"
-        elif c0 == "-": mode = "delete"
-        elif c0 == " ": mode = "keep"
+        if s[0] == "+":
+            mode = "add"
+        elif s[0] == "-":
+            mode = "delete"
+        elif s[0] == " ":
+            mode = "keep"
         else:
             raise DiffError(f"Invalid Line: {s}")
-        line = s[1:]
-        if mode == "keep" and last != mode:
+        s = s[1:]
+
+        if mode == "keep" and last_mode != mode:
             if ins_lines or del_lines:
-                chunks.append(Chunk(
-                    orig_index=len(old) - len(del_lines),
-                    del_lines=del_lines[:],
-                    ins_lines=ins_lines[:],
-                ))
+                chunks.append(
+                    Chunk(
+                        orig_index=len(old) - len(del_lines),
+                        del_lines=del_lines,
+                        ins_lines=ins_lines,
+                    )
+                )
             del_lines, ins_lines = [], []
+
         if mode == "delete":
-            del_lines.append(line); old.append(line)
+            del_lines.append(s)
+            old.append(s)
         elif mode == "add":
-            ins_lines.append(line)
-        else:
-            old.append(line)
+            ins_lines.append(s)
+        elif mode == "keep":
+            old.append(s)
 
     if ins_lines or del_lines:
-        chunks.append(Chunk(orig_index=len(old) - len(del_lines), del_lines=del_lines, ins_lines=ins_lines))
+        chunks.append(
+            Chunk(
+                orig_index=len(old) - len(del_lines),
+                del_lines=del_lines,
+                ins_lines=ins_lines,
+            )
+        )
 
     if index < len(lines) and lines[index] == "*** End of File":
         index += 1
         return old, chunks, index, True
+
+    if index == orig_index:
+        raise DiffError("Nothing in this section")
     return old, chunks, index, False
+
 
 # --------------------------------------------------------------------------- #
 #  Patch → Commit and Commit application
