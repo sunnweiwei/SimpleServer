@@ -25,14 +25,6 @@ from typing import (
 #  Normalisation helpers
 # --------------------------------------------------------------------------- #
 def canonical(s: str) -> str:
-    """
-    Convert *s* to a canonical form for tolerant comparisons:
-      • convert CRLF → LF
-      • convert TABs to single spaces
-      • remove backslashes (escape chars)
-      • collapse all whitespace runs to single spaces
-      • strip leading/trailing whitespace
-    """
     s = s.replace("\r", "").replace("\t", " ").replace("\\", "")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
