@@ -215,7 +215,13 @@ class Parser:
             # Apply all context markers to find the right location
             for marker in context_markers:
                 found = False
-                if marker not in lines[index:]:
+                if marker in lines[index:]:
+                    # Find the exact position of the marker
+                    marker_pos = lines[index:].index(marker)
+                    index = index + marker_pos + 1  # +1 to move past the marker
+                    found = True
+                else:
+                    # Try exact matching with optional whitespace normalization
                     for i, s in enumerate(lines[index:], index):
                         if s == marker or s.strip() == marker.strip():
                             index = i + 1
