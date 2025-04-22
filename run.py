@@ -447,6 +447,6 @@ def kill_process_on_port(port: int):
                 print(f"Could not kill PID {conn.pid}: {e}")
 
 if __name__ == "__main__":
-    kill_process_on_port(4444)
+    # kill_process_on_port(4444)
     app.run(host="0.0.0.0", port=4444, threaded=True)
     
