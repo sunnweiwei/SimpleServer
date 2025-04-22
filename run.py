@@ -433,5 +433,20 @@ def upload_file_endpoint():
         return jsonify({'error': str(exc)}), 500
     return jsonify({'status': 'ok', 'path': str(target), 'recursive': recursive})
 
+def kill_process_on_port(port: int):
+    import psutil
+    for conn in psutil.net_connections(kind='tcp'):
+        if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port:
+            try:
+                p = psutil.Process(conn.pid)
+                print(f"Killing PID {conn.pid} ({p.name()}) listening on port {port}")
+                p.kill()
+                # give it a moment to die
+                time.sleep(0.5)
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                print(f"Could not kill PID {conn.pid}: {e}")
+
 if __name__ == "__main__":
+    kill_process_on_port(4444)
     app.run(host="0.0.0.0", port=4444, threaded=True)
+    
