@@ -195,55 +195,61 @@ class Parser:
                         "*** End of File",
                 )
         ):
-            # Collect all consecutive context markers
+            # Read context lines (support multiple @@ lines)
             context_markers = []
-            while not self.is_done() and self.startswith("@@"):
-                context_line = self.read_str("@@ ")
-                if context_line.strip():
-                    context_markers.append(context_line)
-                elif self._norm(self._cur_line()) == "@@":
-                    section_str = self.read_line()
-                    if section_str[2:].strip():  # Skip "@@" prefix
-                        context_markers.append(section_str[2:].strip())
 
-            if not context_markers and index == 0:
-                # No context markers at the start is valid
-                pass
-            elif not context_markers:
+            # Keep reading @@ lines until we hit something else
+            while not self.is_done() and (
+                    self.startswith("@@ ") or self._norm(self._cur_line()) == "@@"
+            ):
+                if self.startswith("@@ "):
+                    def_str = self.read_str("@@ ")
+                    if def_str.strip():
+                        context_markers.append(def_str)
+                else:  # Must be exactly "@@"
+                    self.read_line()  # Consume the line but don't use it
+
+            # Validate we have context or it's the start
+            if not (context_markers or index == 0):
                 raise DiffError(f"Invalid line in update section:\n{self._cur_line()}")
 
-            # Apply all context markers to find the right location
+            # Use each context marker to navigate to the correct position
             for marker in context_markers:
                 found = False
+
+                # First try exact match
                 if marker in lines[index:]:
-                    # Find the exact position of the marker
                     marker_pos = lines[index:].index(marker)
-                    index = index + marker_pos + 1  # +1 to move past the marker
+                    index = index + marker_pos + 1
                     found = True
                 else:
-                    # Try exact matching with optional whitespace normalization
+                    # Try whitespace-normalized match
                     for i, s in enumerate(lines[index:], index):
-                        if s == marker or s.strip() == marker.strip():
+                        if s.strip() == marker.strip():
                             index = i + 1
+                            self.fuzz += 1_000
                             found = True
                             break
-                if not found:
-                    # Try fuzzy matching
-                    for i, s in enumerate(lines[index:], index):
-                        if canonical(s) == canonical(marker):
-                            index = i + 1
-                            self.fuzz += 1
-                            found = True
-                            break
+
+                    # Try canonical match
+                    if not found:
+                        for i, s in enumerate(lines[index:], index):
+                            if canonical(s) == canonical(marker):
+                                index = i + 1
+                                self.fuzz += 10_000
+                                found = True
+                                break
+
+                # If all matching attempts failed
                 if not found:
                     raise DiffError(f"Context marker not found: {marker}")
 
-            # Now process the changes as before
+            # Process actual changes (unchanged from original)
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
             new_index, fuzz = find_context(lines, next_ctx, index, eof)
 
             if new_index == -1:
-                # Error reporting code remains unchanged
+                # Error reporting (unchanged from original)
                 best_ratio, best_i = 0.0, -1
                 target = canonical(next_ctx[0]) if next_ctx else ""
                 for i, line in enumerate(lines):
@@ -300,21 +306,21 @@ def find_context_core(
         if [canonical(s) for s in lines[i : i + len(context)]] == norm_ctx:
             return i, 1_000  # small fuzz penalty
 
-    # ---------- (c) canonical stripped -------------------------------------- #
-    strip_ctx = [s.strip() for s in norm_ctx]
-    for i in range(start, len(lines) - len(context) + 1):
-        if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
-            return i, 10_000
-
-    # ---------- (d) fuzzy first-line ---------------------------------------- #
-    target = norm_ctx[0]
-    best_ratio, best_i = 0.0, -1
-    for i, line in enumerate(lines[start:], start):
-        ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
-        if ratio > best_ratio:
-            best_ratio, best_i = ratio, i
-    if best_ratio >= 0.75:
-        return best_i, 50_000
+    # # ---------- (c) canonical stripped -------------------------------------- #
+    # strip_ctx = [s.strip() for s in norm_ctx]
+    # for i in range(start, len(lines) - len(context) + 1):
+    #     if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
+    #         return i, 10_000
+    # 
+    # # ---------- (d) fuzzy first-line ---------------------------------------- #
+    # target = norm_ctx[0]
+    # best_ratio, best_i = 0.0, -1
+    # for i, line in enumerate(lines[start:], start):
+    #     ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
+    #     if ratio > best_ratio:
+    #         best_ratio, best_i = ratio, i
+    # if best_ratio >= 0.9:
+    #     return best_i, 50_000
 
     # ---------- give up ----------------------------------------------------- #
     return -1, 0
