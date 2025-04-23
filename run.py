@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple
 from flask import Flask, jsonify, request
 
 import apply_patch
+import oai_apply
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment setup
@@ -157,12 +158,15 @@ _PY_LOCK = threading.Lock()
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     os.chdir(cwd)
     try:
-        out = apply_patch.process_patch(
-            block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file
-        )
+        out = oai_apply.process_patch(block, oai_apply.open_file, oai_apply.write_file, oai_apply.remove_file)
         return out + "\n", ""
     except Exception:
-        return "", traceback.format_exc()
+        try:
+            out = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file,
+                                            apply_patch.remove_file)
+            return out + "\n", ""
+        except Exception:
+            return "", traceback.format_exc()
 
 def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
     global PY_REPL
@@ -447,6 +451,5 @@ def kill_process_on_port(port: int):
                 print(f"Could not kill PID {conn.pid}: {e}")
 
 if __name__ == "__main__":
-    # kill_process_on_port(4444)
+    kill_process_on_port(4444)
     app.run(host="0.0.0.0", port=4444, threaded=True)
-    
