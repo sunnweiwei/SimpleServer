@@ -165,10 +165,10 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
             out = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file,
                                             apply_patch.remove_file)
             return out + "\n", ""
-        except Exception:
-            return "", traceback.format_exc()
+        except Exception as e:
+            return "", "Error when applying patch:\n" + str(e)
 
-def _dispatch(cell: str, cwd: Path) -> Tuple[str, str]:
+def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
     global PY_REPL
     lines = cell.splitlines()
     i = 0
