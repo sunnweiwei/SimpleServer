@@ -276,7 +276,7 @@ class Parser:
     def _parse_add_file(self) -> PatchAction:
         lines: List[str] = []
         while not self.is_done(
-            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:")
+            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:", "*** End of File")
         ):
             s = self.read_line()
             if not s.startswith("+"):
@@ -311,7 +311,7 @@ def find_context_core(
     # for i in range(start, len(lines) - len(context) + 1):
     #     if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
     #         return i, 10_000
-    # 
+    #
     # # ---------- (d) fuzzy first-line ---------------------------------------- #
     # target = norm_ctx[0]
     # best_ratio, best_i = 0.0, -1
