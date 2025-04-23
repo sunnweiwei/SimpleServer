@@ -158,7 +158,7 @@ _PY_LOCK = threading.Lock()
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     os.chdir(cwd)
     try:
-        out = oai_apply.process_patch(block, oai_apply.open_file, oai_apply.write_file, oai_apply.remove_file)
+        out = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file, apply_patch.remove_file)
         return out + "\n", ""
     except Exception:
         try:
@@ -166,7 +166,7 @@ def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
                                             apply_patch.remove_file)
             return out + "\n", ""
         except Exception as e:
-            return "", "Error when applying patch:\n" + str(e)
+            return "", "ERROR apply_patch.DiffError:\n" + str(e)
 
 def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
     global PY_REPL
