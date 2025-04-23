@@ -307,20 +307,20 @@ def find_context_core(
             return i, 1_000  # small fuzz penalty
 
     # # ---------- (c) canonical stripped -------------------------------------- #
-    # strip_ctx = [s.strip() for s in norm_ctx]
-    # for i in range(start, len(lines) - len(context) + 1):
-    #     if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
-    #         return i, 10_000
+    strip_ctx = [s.strip() for s in norm_ctx]
+    for i in range(start, len(lines) - len(context) + 1):
+        if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
+            return i, 10_000
     #
     # # ---------- (d) fuzzy first-line ---------------------------------------- #
-    # target = norm_ctx[0]
-    # best_ratio, best_i = 0.0, -1
-    # for i, line in enumerate(lines[start:], start):
-    #     ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
-    #     if ratio > best_ratio:
-    #         best_ratio, best_i = ratio, i
-    # if best_ratio >= 0.9:
-    #     return best_i, 50_000
+    target = norm_ctx[0]
+    best_ratio, best_i = 0.0, -1
+    for i, line in enumerate(lines[start:], start):
+        ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_i = ratio, i
+    if best_ratio >= 1.0:
+        return best_i, 50_000
 
     # ---------- give up ----------------------------------------------------- #
     return -1, 0
