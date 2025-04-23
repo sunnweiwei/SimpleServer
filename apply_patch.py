@@ -6,6 +6,7 @@ A self‑contained **pure‑Python 3.9+** utility for applying human‑readable
 
 from __future__ import annotations
 
+import copy
 import pathlib
 import re
 import difflib
@@ -109,9 +110,9 @@ class Parser:
         if self.index >= len(self.lines):
             return True
         if (
-            prefixes
-            and len(prefixes) > 0
-            and self._norm(self._cur_line()).startswith(prefixes)
+                prefixes
+                and len(prefixes) > 0
+                and self._norm(self._cur_line()).startswith(prefixes)
         ):
             return True
         return False
@@ -127,7 +128,7 @@ class Parser:
         if prefix == "":
             raise ValueError("read_str() requires a non-empty prefix")
         if self._norm(self._cur_line()).startswith(prefix):
-            text = self._cur_line()[len(prefix) :]
+            text = self._cur_line()[len(prefix):]
             self.index += 1
             return text
         return ""
@@ -148,7 +149,7 @@ class Parser:
                     raise DiffError(f"Duplicate update for file: {path}")
                 move_to = self.read_str("*** Move to: ")
                 if path not in self.current_files:
-                    raise DiffError(f"Update File Error - missing file: {path}")
+                    raise DiffError(f"Update File Error - missing file: {path}. If you want to add file, please use *** Add File: path.")
                 text = self.current_files[path]
                 action = self._parse_update_file(text)
                 action.move_path = move_to or None
@@ -175,7 +176,8 @@ class Parser:
                 self.patch.actions[path] = self._parse_add_file()
                 continue
 
-            raise DiffError(f"Unknown line while parsing: {self._cur_line()}")
+            raise DiffError(f"Unknown line while parsing: {self._cur_line()}. "
+                            f"Must start with *** Update File: , *** Delete File: , or *** Add File: ")
 
         if not self.startswith("*** End Patch"):
             raise DiffError("Missing *** End Patch sentinel")
@@ -197,33 +199,31 @@ class Parser:
         ):
             # Read context lines (support multiple @@ lines)
             context_markers = []
+            section_str = []
 
             # Keep reading @@ lines until we hit something else
-            while not self.is_done() and (
-                    self.startswith("@@ ") or self._norm(self._cur_line()) == "@@"
-            ):
+            while not self.is_done() and (self.startswith("@@ ") or self._norm(self._cur_line()) == "@@"):
                 if self.startswith("@@ "):
                     def_str = self.read_str("@@ ")
                     if def_str.strip():
                         context_markers.append(def_str)
                 else:  # Must be exactly "@@"
                     self.read_line()  # Consume the line but don't use it
+                    section_str.append("@@")
 
             # Validate we have context or it's the start
-            if not (context_markers or index == 0):
+            if not (context_markers or section_str or index == 0):
                 raise DiffError(f"Invalid line in update section:\n{self._cur_line()}")
 
             # Use each context marker to navigate to the correct position
             for marker in context_markers:
                 found = False
-
                 # First try exact match
                 if marker in lines[index:]:
                     marker_pos = lines[index:].index(marker)
                     index = index + marker_pos + 1
                     found = True
                 else:
-                    # Try whitespace-normalized match
                     for i, s in enumerate(lines[index:], index):
                         if s.strip() == marker.strip():
                             index = i + 1
@@ -231,39 +231,47 @@ class Parser:
                             found = True
                             break
 
-                    # Try canonical match
                     if not found:
                         for i, s in enumerate(lines[index:], index):
-                            if canonical(s) == canonical(marker):
+                            if canonical(s).strip() == canonical(marker).strip():
                                 index = i + 1
                                 self.fuzz += 10_000
                                 found = True
                                 break
-
-                # If all matching attempts failed
                 if not found:
-                    raise DiffError(f"Context marker not found: {marker}")
+                    raise DiffError(f"Can not found @@ class / function code context: {marker}. Please re-check the original file to ensure `{marker}` exists and correct the @@ context.")
 
-            # Process actual changes (unchanged from original)
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
+            if end_idx == self.index:  # Nothing in this section
+                continue
+
             new_index, fuzz = find_context(lines, next_ctx, index, eof)
 
             if new_index == -1:
                 # Error reporting (unchanged from original)
                 best_ratio, best_i = 0.0, -1
-                target = canonical(next_ctx[0]) if next_ctx else ""
+                target = "\n".join([canonical(ln).strip() for ln in next_ctx]) if next_ctx else ""
                 for i, line in enumerate(lines):
-                    r = difflib.SequenceMatcher(None, canonical(line), target).ratio()
+                    cand_chunk = line[i:i + len(next_ctx)]
+                    cand_chunk = [canonical(ln).strip() for ln in cand_chunk] if next_ctx else ""
+                    r = difflib.SequenceMatcher(None, cand_chunk, target).ratio()
                     if r > best_ratio:
                         best_ratio, best_i = r, i
                 ctx_txt = "\n".join(next_ctx[:3])
-                cand_line = lines[best_i] if best_i != -1 else ""
-                raise DiffError(
-                    f"Context-match failed at patch offset {self.index}.\n"
-                    f"Expected context (first 3 lines):\n>>> {ctx_txt}\n"
-                    f"Closest match in file at line {best_i + 1 if best_i != -1 else 'N/A'} "
-                    f"(similarity {best_ratio:.2f}):\n>>> {cand_line!r}"
-                )
+                cand_line = "\n".join(lines[best_i: best_i + len(next_ctx)]) if best_i != -1 else ""
+                if best_i != -1:
+                    error_msg = (
+                        f"Context-match failed at patch offset {self.index}.\n"
+                        f"Expected context:\n{ctx_txt}\n"
+                        f"Closest match in file at line {best_i + 1 if best_i != -1 else 'N/A'} "
+                        f"(similarity {best_ratio:.2f}):\n{cand_line}"
+                    )
+                else:
+                    error_msg = (
+                        f"Context-match failed at patch offset {self.index}.\n"
+                        f"Expected context:\n{ctx_txt}\n"
+                    )
+                raise DiffError(error_msg)
 
             self.fuzz += fuzz
             for ch in chunks:
@@ -276,7 +284,7 @@ class Parser:
     def _parse_add_file(self) -> PatchAction:
         lines: List[str] = []
         while not self.is_done(
-            ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:", "*** End of File")
+                ("*** End Patch", "*** Update File:", "*** Delete File:", "*** Add File:", "*** End of File")
         ):
             s = self.read_line()
             if not s.startswith("+"):
@@ -289,45 +297,47 @@ class Parser:
 #  Helper functions
 # --------------------------------------------------------------------------- #
 def find_context_core(
-    lines: List[str], context: List[str], start: int
+        lines: List[str], context: List[str], start: int
 ) -> Tuple[int, int]:
     """Return (index, fuzz_score) or (-1, 0) if no match."""
     if not context:
         return start, 0
 
     # ---------- (a) raw exact ------------------------------------------------ #
-    for i in range(start, len(lines) - len(context) + 1):
-        if lines[i : i + len(context)] == context:
+    for i in range(start, len(lines)):
+        if lines[i: i + len(context)] == context:
             return i, 0
+
+    for i in range(start, len(lines)):
+        if [s.rstrip() for s in lines[i: i + len(context)]] == [
+            s.rstrip() for s in context
+        ]:
+            return i, 1
+
+    for i in range(start, len(lines)):
+        if [s.strip() for s in lines[i: i + len(context)]] == [
+            s.strip() for s in context
+        ]:
+            return i, 100
 
     # ---------- (b) canonical exact ----------------------------------------- #
     norm_ctx = [canonical(s) for s in context]
-    for i in range(start, len(lines) - len(context) + 1):
-        if [canonical(s) for s in lines[i : i + len(context)]] == norm_ctx:
+    for i in range(start, len(lines)):
+        if [canonical(s) for s in lines[i: i + len(context)]] == norm_ctx:
             return i, 1_000  # small fuzz penalty
 
     # # ---------- (c) canonical stripped -------------------------------------- #
     strip_ctx = [s.strip() for s in norm_ctx]
-    for i in range(start, len(lines) - len(context) + 1):
-        if [canonical(s).strip() for s in lines[i : i + len(context)]] == strip_ctx:
+    for i in range(start, len(lines)):
+        if [canonical(s).strip() for s in lines[i: i + len(context)]] == strip_ctx:
             return i, 10_000
-    #
-    # # ---------- (d) fuzzy first-line ---------------------------------------- #
-    target = norm_ctx[0]
-    best_ratio, best_i = 0.0, -1
-    for i, line in enumerate(lines[start:], start):
-        ratio = difflib.SequenceMatcher(None, canonical(line), target).ratio()
-        if ratio > best_ratio:
-            best_ratio, best_i = ratio, i
-    if best_ratio >= 1.0:
-        return best_i, 50_000
 
     # ---------- give up ----------------------------------------------------- #
     return -1, 0
 
 
 def find_context(
-    lines: List[str], context: List[str], start: int, eof: bool
+        lines: List[str], context: List[str], start: int, eof: bool
 ) -> Tuple[int, int]:
     if eof:
         new_index, fuzz = find_context_core(lines, context, len(lines) - len(context))
@@ -339,32 +349,32 @@ def find_context(
 
 
 def peek_next_section(
-    lines: List[str], index: int
+        lines: List[str], index: int
 ) -> Tuple[List[str], List[Chunk], int, bool]:
     old: List[str] = []
     del_lines: List[str] = []
     ins_lines: List[str] = []
     chunks: List[Chunk] = []
     mode = "keep"
-    orig_index = index
+    orig_index = copy.deepcopy(index)
 
     while index < len(lines):
         s = lines[index]
         if s.startswith(
-            (
-                "@@",
-                "*** End Patch",
-                "*** Update File:",
-                "*** Delete File:",
-                "*** Add File:",
-                "*** End of File",
-            )
+                (
+                        "@@",
+                        "*** End Patch",
+                        "*** Update File:",
+                        "*** Delete File:",
+                        "*** Add File:",
+                        "*** End of File",
+                )
         ):
             break
         if s == "***":
             break
         if s.startswith("***"):
-            raise DiffError(f"Invalid Line: {s}")
+            break
         index += 1
 
         last_mode = mode
@@ -417,7 +427,7 @@ def peek_next_section(
         return old, chunks, index, True
 
     if index == orig_index:
-        raise DiffError("Nothing in this section")
+        return old, chunks, index, False
     return old, chunks, index, False
 
 
@@ -441,7 +451,7 @@ def _get_updated_file(text: str, action: PatchAction, path: str) -> str:
                 f"{path}: overlapping chunks at {orig_index} > {chunk.orig_index}"
             )
 
-        dest_lines.extend(orig_lines[orig_index : chunk.orig_index])
+        dest_lines.extend(orig_lines[orig_index: chunk.orig_index])
         orig_index = chunk.orig_index
 
         dest_lines.extend(chunk.ins_lines)
@@ -481,9 +491,9 @@ def patch_to_commit(patch: Patch, orig: Dict[str, str]) -> Commit:
 def text_to_patch(text: str, orig: Dict[str, str]) -> Tuple[Patch, int]:
     lines = text.splitlines()  # preserves blank lines, no strip()
     if (
-        len(lines) < 2
-        or not Parser._norm(lines[0]).startswith("*** Begin Patch")
-        or Parser._norm(lines[-1]) != "*** End Patch"
+            len(lines) < 2
+            or not Parser._norm(lines[0]).startswith("*** Begin Patch")
+            or Parser._norm(lines[-1]) != "*** End Patch"
     ):
         raise DiffError("Invalid patch text - missing sentinels")
 
@@ -495,11 +505,11 @@ def text_to_patch(text: str, orig: Dict[str, str]) -> Tuple[Patch, int]:
 def identify_files_needed(text: str) -> List[str]:
     lines = text.splitlines()
     return [
-        line[len("*** Update File: ") :]
+        line[len("*** Update File: "):]
         for line in lines
         if line.startswith("*** Update File: ")
     ] + [
-        line[len("*** Delete File: ") :]
+        line[len("*** Delete File: "):]
         for line in lines
         if line.startswith("*** Delete File: ")
     ]
@@ -508,7 +518,7 @@ def identify_files_needed(text: str) -> List[str]:
 def identify_files_added(text: str) -> List[str]:
     lines = text.splitlines()
     return [
-        line[len("*** Add File: ") :]
+        line[len("*** Add File: "):]
         for line in lines
         if line.startswith("*** Add File: ")
     ]
@@ -522,9 +532,9 @@ def load_files(paths: List[str], open_fn: Callable[[str], str]) -> Dict[str, str
 
 
 def apply_commit(
-    commit: Commit,
-    write_fn: Callable[[str, str], None],
-    remove_fn: Callable[[str], None],
+        commit: Commit,
+        write_fn: Callable[[str, str], None],
+        remove_fn: Callable[[str], None],
 ) -> None:
     for path, change in commit.changes.items():
         if change.type is ActionType.DELETE:
@@ -543,10 +553,10 @@ def apply_commit(
 
 
 def process_patch(
-    text: str,
-    open_fn: Callable[[str], str],
-    write_fn: Callable[[str, str], None],
-    remove_fn: Callable[[str], None],
+        text: str,
+        open_fn: Callable[[str], str],
+        write_fn: Callable[[str, str], None],
+        remove_fn: Callable[[str], None],
 ) -> str:
     if not text.startswith("*** Begin Patch"):
         raise DiffError("Patch text must start with *** Begin Patch")
