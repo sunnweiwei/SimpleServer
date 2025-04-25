@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re  # Add this import for ANSI stripping
 import subprocess
 import tempfile
 import threading
@@ -18,6 +19,15 @@ from flask import Flask, jsonify, request
 
 import apply_patch
 import oai_apply
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI color code handling
+# ─────────────────────────────────────────────────────────────────────────────
+def strip_ansi_codes(text):
+    """Remove ANSI color and formatting codes from text."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment setup
@@ -36,13 +46,14 @@ proc_env = subprocess.run(
 _SANDBOX_ENV: Dict[str, str] = {
     **dict(line.split("=", 1) for line in proc_env.stdout.splitlines() if "=" in line)
 }
-_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX/'bin'}:{_SANDBOX_ENV.get('PATH','')}"
+_SANDBOX_ENV["PATH"] = f"{SANDBOX_PREFIX / 'bin'}:{_SANDBOX_ENV.get('PATH', '')}"
 
 DEFAULT_ROOT = Path("/testbed").resolve()
 DEFAULT_ROOT.mkdir(parents=True, exist_ok=True)
 SERVER_FILE = Path(__file__).resolve().as_posix()
 
 app = Flask(__name__)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Stateful shell for legacy commands
@@ -59,8 +70,10 @@ def _start_shell() -> subprocess.Popen[str]:
         bufsize=1
     )
 
+
 SHELL_PROC = _start_shell()
 SHELL_LOCK = threading.Lock()
+
 
 def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int]:
     """
@@ -96,7 +109,10 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
                 rc = int(line[len(marker):].strip())
                 break
             out_lines.append(line)
-        return "".join(out_lines), "" if rc == 0 else f"exit {rc}", rc
+
+        raw_output = "".join(out_lines)
+        cleaned_output = strip_ansi_codes(raw_output)
+        return cleaned_output, "" if rc == 0 else f"exit {rc}", rc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,9 +120,14 @@ def _exec_shell(cmd: str, cwd: Path, timeout: int = None) -> Tuple[str, str, int
 # ─────────────────────────────────────────────────────────────────────────────
 _REPL_PATH = Path(tempfile.gettempdir()) / "ipython_repl.py"
 _REPL_PATH.write_text(textwrap.dedent("""
-import sys, json, io, traceback, os
+import sys, json, io, traceback, os, re
 from contextlib import redirect_stdout, redirect_stderr
 from IPython.core.interactiveshell import InteractiveShell
+
+# Function to strip ANSI color codes
+def strip_ansi_codes(text):
+    ansi_escape = re.compile(r'\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
 # 1) Always search /testbed before anything else
 sys.path.insert(0, "/testbed")
@@ -134,15 +155,18 @@ for raw in sys.stdin:
         with redirect_stdout(outbuf), redirect_stderr(errbuf):
             shell.run_cell(code)
         out, err = outbuf.getvalue(), errbuf.getvalue()
+        # Strip ANSI color codes from both stdout and stderr
+        out, err = strip_ansi_codes(out), strip_ansi_codes(err)
     except Exception:
-        out, err = '', traceback.format_exc()
+        out, err = '', strip_ansi_codes(traceback.format_exc())
     sys.stdout.write(json.dumps({'out': out, 'err': err}) + '\\n')
     sys.stdout.flush()
 """))
 
+
 def _start_repl() -> subprocess.Popen[str]:
     return subprocess.Popen(
-        [str(SANDBOX_PREFIX/"bin/python"), "-u", str(_REPL_PATH)],
+        [str(SANDBOX_PREFIX / "bin/python"), "-u", str(_REPL_PATH)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -152,21 +176,26 @@ def _start_repl() -> subprocess.Popen[str]:
         bufsize=1
     )
 
+
 PY_REPL = _start_repl()
 _PY_LOCK = threading.Lock()
+
 
 def _exec_apply_patch(block: str, cwd: Path) -> Tuple[str, str]:
     os.chdir(cwd)
     try:
+        # Try OpenAI process_patch
         out = oai_apply.process_patch(block, oai_apply.open_file, oai_apply.write_file, oai_apply.remove_file)
-        return out + "\n", ""
+        return strip_ansi_codes(out + "\n"), ""
     except Exception:
         try:
+            # When Error, try custom version for relaxed matching and more informative error message
             out = apply_patch.process_patch(block, apply_patch.open_file, apply_patch.write_file,
                                             apply_patch.remove_file)
-            return out + "\n", ""
+            return strip_ansi_codes(out + "\n"), ""
         except Exception as e:
-            return "", "ERROR apply_patch.DiffError:\n" + str(e)
+            return "", strip_ansi_codes("ERROR apply_patch.DiffError:\n" + str(e))
+
 
 def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
     global PY_REPL
@@ -177,9 +206,10 @@ def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
     remainder = "\n".join(lines[i:])
 
     if remainder.lstrip().startswith("%%bash") and "apply_patch" not in cell:
-        bash_lines = remainder.splitlines()[1:] # drop the '%%bash' line
+        bash_lines = remainder.splitlines()[1:]  # drop the '%%bash' line
         bash_script = "\n".join(bash_lines)
         out, err, rc = _exec_shell(bash_script, cwd)
+        # Output already stripped in _exec_shell
         return out, ""
 
     # Special: %%bash + apply_patch after comments
@@ -210,6 +240,7 @@ def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
             if resp:
                 try:
                     data = json.loads(resp)
+                    # ANSI stripping is now handled in the IPython REPL script
                     return data["out"], data["err"]
                 except json.JSONDecodeError:
                     continue
@@ -217,7 +248,8 @@ def _dispatch(cell: str, cwd: Path) -> None | tuple[str, str] | tuple[Any, Any]:
             # If stdout closed unexpectedly, restart REPL
             err_text = PY_REPL.stderr.read() or "(no stderr output)"
             globals()['PY_REPL'] = _start_repl()
-            return "", f"REPL crashed:\n{err_text}"
+            return "", strip_ansi_codes(f"REPL crashed:\n{err_text}")
+
 
 def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
     """
@@ -247,7 +279,7 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
             PY_REPL.send_signal(signal.SIGINT)
         except Exception:
             pass
-        return "", "Timed out", True
+        return "", strip_ansi_codes("Timed out"), True
     return res.get(0, ""), err.get(0, ""), False
 
 
@@ -267,6 +299,7 @@ def _remove_binary_diffs(patch_text: str) -> str:
     if block and not binary:
         cleaned.extend(block)
     return "\n".join(cleaned)
+
 
 def get_git_patch(base_commit: str, workdir: Path = DEFAULT_ROOT) -> str:
     cwd = workdir.resolve()
@@ -292,6 +325,7 @@ done
         shell=True, cwd=cwd, text=True, stdout=subprocess.PIPE
     )
     return _remove_binary_diffs(diff.stdout)
+
 
 def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: int = 1800) -> Dict[str, Any]:
     report = {
@@ -328,7 +362,7 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
         return report
 
     eval_out, eval_err, rc = _exec_shell('/tmp/eval.sh', cwd, timeout=timeout)
-    report['eval_output'] = eval_out + eval_err
+    report['eval_output'] = strip_ansi_codes(eval_out + eval_err)
     if rc == -9:
         report['test_timeout'] = True
     elif rc != 0:
@@ -337,10 +371,12 @@ def _evaluate_patch(model_patch: str, eval_script: str, workdir: Path, timeout: 
         report['resolved'] = 'RESOLVED' in report['eval_output'].upper()
     return report
 
+
 # ─── Flask routes ─────────────────────────────────────────────────────────────
 @app.route('/alive', methods=['GET'])
 def alive():
     return 'ok', 200
+
 
 @app.route('/execute', methods=['POST'])
 def execute_endpoint():
@@ -356,7 +392,7 @@ def execute_endpoint():
             args = json.loads(msg.get('arguments', '{}'))
         except json.JSONDecodeError as exc:
             results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': msg,
-                            'output': '', 'error': str(exc), 'timed_out': False, 'duration': 0.0})
+                            'output': '', 'error': strip_ansi_codes(str(exc)), 'timed_out': False, 'duration': 0.0})
             continue
         code = args.get('input')
         if code is None:
@@ -365,12 +401,13 @@ def execute_endpoint():
             continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
-        print(err)
+        print(strip_ansi_codes(err))
         results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code,
                         'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
     if not results:
         return jsonify({'error': 'No python function_call messages found'}), 400
     return jsonify({'results': results, 'overall_duration': round(time.time() - start, 3)})
+
 
 @app.route('/diff', methods=['POST'])
 def diff_endpoint():
@@ -383,8 +420,9 @@ def diff_endpoint():
     try:
         patch = get_git_patch(base_commit, Path(data.get('dir', DEFAULT_ROOT)))
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': strip_ansi_codes(str(exc))}), 500
     return jsonify({'patch': patch})
+
 
 @app.route('/evaluate', methods=['POST'])
 def evaluate_endpoint():
@@ -399,6 +437,7 @@ def evaluate_endpoint():
     )
     return jsonify({'report': report})
 
+
 @app.route('/command', methods=['POST'])
 def command_endpoint():
     if not request.is_json:
@@ -411,6 +450,7 @@ def command_endpoint():
     timeout = int(data.get('timeout', 120))
     out, err, rc = _exec_shell(cmd, cwd, timeout=timeout)
     return jsonify({'stdout': out, 'stderr': err, 'returncode': rc, 'duration': timeout})
+
 
 @app.route('/upload_file', methods=['POST'])
 def upload_file_endpoint():
@@ -434,8 +474,9 @@ def upload_file_endpoint():
         else:
             file_storage.save(target)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': strip_ansi_codes(str(exc))}), 500
     return jsonify({'status': 'ok', 'path': str(target), 'recursive': recursive})
+
 
 def kill_process_on_port(port: int):
     import psutil
@@ -449,6 +490,7 @@ def kill_process_on_port(port: int):
                 time.sleep(0.5)
             except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                 print(f"Could not kill PID {conn.pid}: {e}")
+
 
 if __name__ == "__main__":
     kill_process_on_port(4444)
