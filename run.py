@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
-import re  # Add this import for ANSI stripping
+import re  # Added for ANSI stripping
 import subprocess
 import tempfile
 import threading
@@ -26,8 +26,11 @@ import oai_apply
 # ─────────────────────────────────────────────────────────────────────────────
 def strip_ansi_codes(text):
     """Remove ANSI color and formatting codes from text."""
+    if not isinstance(text, str):
+        return text
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment setup
@@ -126,6 +129,8 @@ from IPython.core.interactiveshell import InteractiveShell
 
 # Function to strip ANSI color codes
 def strip_ansi_codes(text):
+    if not isinstance(text, str):
+        return text
     ansi_escape = re.compile(r'\\x1B(?:[@-Z\\\\-_]|\\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
@@ -264,7 +269,7 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
             o, e = fn(*args)
             res[0], err[0] = o, e
         except Exception:
-            err[0] = traceback.format_exc()
+            err[0] = strip_ansi_codes(traceback.format_exc())
 
     th = threading.Thread(target=target, daemon=True)
     th.start()
@@ -279,7 +284,7 @@ def _run_with_timeout(fn, timeout: int, *args) -> Tuple[str, str, bool]:
             PY_REPL.send_signal(signal.SIGINT)
         except Exception:
             pass
-        return "", strip_ansi_codes("Timed out"), True
+        return "", "Timed out", True
     return res.get(0, ""), err.get(0, ""), False
 
 
@@ -401,7 +406,7 @@ def execute_endpoint():
             continue
         o_start = time.time()
         out, err, timed = _run_with_timeout(_dispatch, 60, code, DEFAULT_ROOT)
-        print(strip_ansi_codes(err))
+        print(err)  # Keep original error for server logs
         results.append({'index': idx, 'call_id': msg.get('call_id'), 'code': code,
                         'output': out, 'error': err, 'timed_out': timed, 'duration': round(time.time() - o_start, 3)})
     if not results:
@@ -449,7 +454,7 @@ def command_endpoint():
     cwd = Path(data.get('dir', DEFAULT_ROOT)).resolve()
     timeout = int(data.get('timeout', 120))
     out, err, rc = _exec_shell(cmd, cwd, timeout=timeout)
-    return jsonify({'stdout': out, 'stderr': err, 'returncode': rc, 'duration': timeout})
+    return jsonify({'stdout': out, 'stderr': strip_ansi_codes(err), 'returncode': rc, 'duration': timeout})
 
 
 @app.route('/upload_file', methods=['POST'])
