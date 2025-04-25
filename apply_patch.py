@@ -83,6 +83,12 @@ class Patch:
     actions: Dict[str, PatchAction] = field(default_factory=dict)
 
 
+def get_patch_line(hunk_header: str) -> int | None:
+    pattern = r'^@@\s+-(\d+),\d+\s+\+\d+,\d+\s+@@'
+    match = re.match(pattern, hunk_header)
+    return int(match.group(1)) if match else None
+
+
 # --------------------------------------------------------------------------- #
 #  Patch text parser
 # --------------------------------------------------------------------------- #
@@ -238,8 +244,16 @@ class Parser:
                                 self.fuzz += 10_000
                                 found = True
                                 break
+
                 if not found:
-                    raise DiffError(f"Can not found @@ class / function code context: {marker}. Please re-check the original file to ensure `{marker}` exists and correct the @@ context.")
+                    # Try line number context
+                    line_number = get_patch_line(marker)
+                    if line_number is not None:
+                        found = True
+
+                if not found:
+                    raise DiffError(f"Cannot find @@ class/function code context: {marker}. "
+                                    f"Please re-check the original file to ensure `{marker}` exists and correct the @@ context.")
 
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
             if end_idx == self.index:  # Nothing in this section
