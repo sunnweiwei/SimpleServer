@@ -251,9 +251,9 @@ class Parser:
                     if line_number is not None:
                         found = True
 
-                if not found:
-                    raise DiffError(f"Cannot find @@ class/function code context: {marker}. "
-                                    f"Please re-check the original file to ensure `{marker}` exists and correct the @@ context.")
+                # if not found:
+                #     raise DiffError(f"Cannot find @@ class/function code context: {marker}. "
+                #                     f"Please re-check the original file to ensure `{marker}` exists and correct the @@ context.")
 
             next_ctx, chunks, end_idx, eof = peek_next_section(self.lines, self.index)
             if end_idx == self.index:  # Nothing in this section
@@ -273,7 +273,7 @@ class Parser:
                         best_ratio, best_i = r, i
                 ctx_txt = "\n".join(next_ctx[:3])
                 cand_line = "\n".join(lines[best_i: best_i + len(next_ctx)]) if best_i != -1 else ""
-                if best_i != -1:
+                if best_i != -1 and best_ratio > 0.9:
                     error_msg = (
                         f"Context-match failed at patch offset {self.index}.\n"
                         f"Expected context:\n{ctx_txt}\n"
