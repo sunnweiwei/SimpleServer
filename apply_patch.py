@@ -276,7 +276,7 @@ class Parser:
                 if best_i != -1 and best_ratio > 0.9:
                     error_msg = (
                         f"Context-match failed at patch offset {self.index}.\n"
-                        f"Expected context:\n{ctx_txt}\n"
+                        f"Can not find context of:\n{ctx_txt}\n"
                         f"Closest match in file at line {best_i + 1 if best_i != -1 else 'N/A'} "
                         f"(similarity {best_ratio:.2f}):\n{cand_line}"
                     )
