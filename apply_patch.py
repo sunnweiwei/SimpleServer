@@ -283,7 +283,7 @@ class Parser:
                 else:
                     error_msg = (
                         f"Context-match failed at patch offset {self.index}.\n"
-                        f"Expected context:\n{ctx_txt}\n"
+                        f"Can not find context of:\n{ctx_txt}\n"
                     )
                 raise DiffError(error_msg)
 
